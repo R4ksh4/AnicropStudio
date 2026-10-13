@@ -20,6 +20,7 @@ from PySide6.QtCore import (
 )
 from focus_inspector import FocusInspector
 from rating_writer import write_photo_rating
+from sony_af import extract_sony_af_points, _sony_af_core, _sony_af_from_jpeg_bytes
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush, QPixmap, 
     QImage, QImageReader, QFontMetrics, QKeyEvent, QMouseEvent, 
@@ -312,10 +313,23 @@ def _raw_bundle(file_path: str, light: bool = False) -> dict:
         bundle["exif"] = res
 
         o = bundle["orientation"]
-        boxes = _af_from_jpeg_bytes(embedded, o) if embedded else []
+        # 【多品牌】内嵌预览 JPEG 里带 MakerNote 的，先按厂商签名分派；
+        # 索尼 ARW 的对焦点在内嵌预览里（0x2027），佳能 CR2/CR3 同理走既有路径。
+        boxes = []
+        if embedded:
+            etiff = _exif_tiff_block(embedded)
+            if etiff is not None:
+                vendor = _makernote_vendor(etiff)
+                if vendor == b'SONY':
+                    boxes = _sony_af_core(etiff, '<' if etiff[:2] == b'II' else '>', o)
+                else:
+                    boxes = _canon_af_core(etiff, '<' if etiff[:2] == b'II' else '>', o)
         if not boxes:
             for tiff, endian in cands:
-                boxes = _canon_af_core(tiff, endian, o)
+                if _makernote_vendor(tiff) == b'SONY':
+                    boxes = _sony_af_core(tiff, endian, o)
+                else:
+                    boxes = _canon_af_core(tiff, endian, o)
                 if boxes:
                     break
         bundle["af"] = boxes or []
@@ -968,9 +982,13 @@ def _af_from_jpeg_bytes(data: bytes, orientation: int = 1) -> list:
     except Exception:
         return []
 
-def extract_canon_af_points(file_path: str, orientation: int = 1) -> list:
-    """佳能 AF 框提取：JPEG 走 APP1；RAW (CR3/CR2) 优先解内嵌预览 JPEG 的 MakerNote
-    （CR3 独立块里的 AFInfo2 是新布局，内嵌预览里带的是已验证正确的经典布局）"""
+def extract_af_points(file_path: str, orientation: int = 1) -> list:
+    """【品牌无关】AF 对焦点提取总入口。按 MakerNote 头部签名分派到各厂商解析器。
+
+    与既有 _canon_af_core 输出契约完全一致：
+        [{"rect": QRectF(归一化左上角x, y, w, h), "in_focus": bool}, ...]
+    佳能路径完全沿用原实现；索尼走sony_af 的独立解析。
+    """
     try:
         is_raw = is_raw_file(file_path)
         if is_raw:
@@ -982,11 +1000,101 @@ def extract_canon_af_points(file_path: str, orientation: int = 1) -> list:
             data = f.read(250000)
         if len(data) < 4:
             return []
-        if data[:2] == b'\xFF\xD8':
-            return _af_from_jpeg_bytes(data, orientation)
-        return []
+        if data[:2] != b'\xFF\xD8':
+            return []
+
+        tiff_data = _exif_tiff_block(data)
+        if tiff_data is None:
+            return []
+
+        # 佳能 / 索尼 各自解析；先看 MakerNote 签名，避免无谓的重复扫描
+        if _makernote_vendor(tiff_data) == b'SONY':
+            boxes = _sony_af_core(tiff_data, '<', orientation)
+            if boxes:
+                return boxes
+        return _canon_af_core(tiff_data,
+                              '<' if tiff_data[:2] == b'II' else '>',
+                              orientation) or []
     except Exception:
         return []
+
+
+def extract_canon_af_points(file_path: str, orientation: int = 1) -> list:
+    """【兼容保留】原佳能专用入口，等价于 extract_af_points（分派器会自动识别品牌）。"""
+    return extract_af_points(file_path, orientation)
+
+
+def _exif_tiff_block(data: bytes):
+    """从 JPEG 字节流的 APP1/EXIF 里取出 TIFF 块（去掉 'Exif\\0\\0' 头），失败返回 None。"""
+    try:
+        if len(data) < 4 or data[:2] != b'\xFF\xD8':
+            return None
+        idx = 2
+        n = len(data)
+        while idx < n - 4:
+            if data[idx] != 0xFF:
+                break
+            marker = data[idx + 1]
+            if marker in (0xD9, 0xDA):
+                break
+            if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+                idx += 2
+                continue
+            length = int.from_bytes(data[idx + 2:idx + 4], 'big')
+            if marker == 0xE1:
+                body = data[idx + 4:idx + 2 + length]
+                if body.startswith(b'Exif\x00\x00'):
+                    tiff_data = body[6:]
+                    if tiff_data[:2] in (b'II', b'MM'):
+                        return tiff_data
+            idx += 2 + length
+        return None
+    except Exception:
+        return None
+
+
+def _makernote_vendor(tiff_data: bytes):
+    """返回 MakerNote 的厂商签名字节（如 b'SONY'），取不到返回 None。"""
+    try:
+        endian = '<' if tiff_data[:2] == b'II' else ('>' if tiff_data[:2] == b'MM' else None)
+        if endian is None:
+            return None
+        ifd0_off = struct.unpack(endian + 'I', tiff_data[4:8])[0]
+        if ifd0_off + 2 > len(tiff_data):
+            return None
+        num_entries = struct.unpack(endian + 'H', tiff_data[ifd0_off:ifd0_off + 2])[0]
+        mn_off = None
+        exif_off = None
+        for i in range(num_entries):
+            ep = ifd0_off + 2 + i * 12
+            if ep + 12 > len(tiff_data):
+                break
+            tag = struct.unpack(endian + 'H', tiff_data[ep:ep + 2])[0]
+            if tag == 0x927C:
+                t_field = struct.unpack(endian + 'H', tiff_data[ep + 2:ep + 4])[0]
+                c_field = struct.unpack(endian + 'I', tiff_data[ep + 4:ep + 8])[0]
+                mn_off = (struct.unpack(endian + 'I', tiff_data[ep + 8:ep + 12])[0]
+                          if t_field == 7 and c_field > 4 else ep + 8)
+                break
+            elif tag == 0x8769:
+                exif_off = struct.unpack(endian + 'I', tiff_data[ep + 8:ep + 12])[0]
+        if mn_off is None and exif_off and exif_off + 2 <= len(tiff_data):
+            n2 = struct.unpack(endian + 'H', tiff_data[exif_off:exif_off + 2])[0]
+            for j in range(n2):
+                q = exif_off + 2 + j * 12
+                if q + 12 > len(tiff_data):
+                    break
+                if struct.unpack(endian + 'H', tiff_data[q:q + 2])[0] == 0x927C:
+                    t_field = struct.unpack(endian + 'H', tiff_data[q + 2:q + 4])[0]
+                    c_field = struct.unpack(endian + 'I', tiff_data[q + 4:q + 8])[0]
+                    mn_off = (struct.unpack(endian + 'I', tiff_data[q + 8:q + 12])[0]
+                              if t_field == 7 and c_field > 4 else q + 8)
+                    break
+        if not mn_off or mn_off >= len(tiff_data):
+            return None
+        return tiff_data[mn_off:mn_off + 4]
+    except Exception:
+        return None
 
 def _canon_af_core(tiff_data: bytes, endian: str, orientation: int = 1) -> list:
     af_boxes = []
