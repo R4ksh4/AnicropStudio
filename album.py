@@ -1,3 +1,4 @@
+from sony_af import extract_sony_af_points, _sony_af_core, _sony_af_from_jpeg_bytes
 import os
 import sys
 import struct
@@ -20,6 +21,7 @@ from PySide6.QtCore import (
 )
 from focus_inspector import FocusInspector
 from rating_writer import write_photo_rating
+from sony_af import extract_sony_af_points, _sony_af_core, _sony_af_from_jpeg_bytes
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush, QPixmap, 
     QImage, QImageReader, QFontMetrics, QKeyEvent, QMouseEvent, 
@@ -312,12 +314,30 @@ def _raw_bundle(file_path: str, light: bool = False) -> dict:
         bundle["exif"] = res
 
         o = bundle["orientation"]
-        boxes = _af_from_jpeg_bytes(embedded, o) if embedded else []
+        # 【多品牌】对焦点提取：双通道兜底管线
+        # 路径 1: 优先从内嵌预览 JPEG 尝试提取 (部分机型内嵌带 MakerNote)
+        boxes = []
+        if embedded:
+            etiff = _exif_tiff_block(embedded)
+            if etiff is not None:
+                vendor = _makernote_vendor(etiff)
+                if vendor == b'SONY':
+                    boxes = _sony_af_core(etiff, '<' if etiff[:2] == b'II' else '>', o)
+                else:
+                    boxes = _canon_af_core(etiff, '<' if etiff[:2] == b'II' else '>', o)
+
+        # 路径 2: 内嵌预览无 MakerNote 时，直接解剖 RAW 容器自身 (索尼 ARW 主干即是 TIFF / 佳能 CR3 独立块)
         if not boxes:
             for tiff, endian in cands:
+                # 尝试索尼 ARW 容器本身 (读取 IFD0 -> ExifIFD -> SONY MakerNote 0x2027)
+                boxes = _sony_af_core(tiff, endian, o)
+                if boxes:
+                    break
+                # 尝试佳能原生/独立块
                 boxes = _canon_af_core(tiff, endian, o)
                 if boxes:
                     break
+
         bundle["af"] = boxes or []
     except Exception:
         pass
@@ -943,50 +963,106 @@ def extract_raw_orientation(file_path: str) -> int:
     except Exception:
         return 1
 
-def _af_from_jpeg_bytes(data: bytes, orientation: int = 1) -> list:
-    """从一段 JPEG 字节流的 APP1/EXIF 里解佳能 AF 框（标准 JPG 布局，已验证正确）"""
+def _exif_tiff_block(data: bytes) -> bytes | None:
+    """从 JPEG 字节流中定位并提取 APP1/Exif 后的 TIFF 数据块"""
+    if len(data) < 4 or data[:2] != b'\xFF\xD8':
+        return None
+    idx = 2
+    n = len(data)
+    while idx < n - 4:
+        if data[idx] != 0xFF:
+            break
+        m = data[idx + 1]
+        if m in (0xD9, 0xDA):
+            break
+        if m == 0xD8 or m == 0x01 or 0xD0 <= m <= 0xD7:
+            idx += 2
+            continue
+        ln = int.from_bytes(data[idx + 2:idx + 4], 'big')
+        if m == 0xE1:
+            body = data[idx + 4:idx + 2 + ln]
+            if body.startswith(b'Exif\x00\x00'):
+                tiff = body[6:]
+                if tiff[:2] in (b'II', b'MM'):
+                    return tiff
+        idx += 2 + ln
+    return None
+
+
+def _makernote_vendor(tiff_data: bytes) -> bytes | None:
+    """快速嗅探 MakerNote 厂商签名：b'SONY' / b'CANON' 等"""
+    if len(tiff_data) < 8:
+        return None
+    endian = '<' if tiff_data[:2] == b'II' else ('>' if tiff_data[:2] == b'MM' else None)
+    if not endian:
+        return None
     try:
-        if len(data) < 4 or data[:2] != b'\xFF\xD8':
+        ifd0_off = struct.unpack(endian + 'I', tiff_data[4:8])[0]
+        if ifd0_off + 2 > len(tiff_data):
+            return None
+        num_entries = struct.unpack(endian + 'H', tiff_data[ifd0_off:ifd0_off + 2])[0]
+        mn_off = None
+        exif_off = None
+        for i in range(num_entries):
+            ep = ifd0_off + 2 + i * 12
+            if ep + 12 > len(tiff_data):
+                break
+            tag = struct.unpack(endian + 'H', tiff_data[ep:ep + 2])[0]
+            if tag == 0x927C:
+                mn_off = struct.unpack(endian + 'I', tiff_data[ep + 8:ep + 12])[0]
+                break
+            elif tag == 0x8769:
+                exif_off = struct.unpack(endian + 'I', tiff_data[ep + 8:ep + 12])[0]
+        if mn_off is None and exif_off and exif_off + 2 <= len(tiff_data):
+            n2 = struct.unpack(endian + 'H', tiff_data[exif_off:exif_off + 2])[0]
+            for j in range(n2):
+                ep = exif_off + 2 + j * 12
+                if ep + 12 > len(tiff_data):
+                    break
+                tag = struct.unpack(endian + 'H', tiff_data[ep:ep + 2])[0]
+                if tag == 0x927C:
+                    mn_off = struct.unpack(endian + 'I', tiff_data[ep + 8:ep + 12])[0]
+                    break
+        if mn_off and mn_off + 12 <= len(tiff_data):
+            head = tiff_data[mn_off:mn_off + 12]
+            if head.startswith(b'SONY'):
+                return b'SONY'
+    except Exception:
+        pass
+    return None
+
+
+def _af_from_jpeg_bytes(data: bytes, orientation: int = 1) -> list:
+    """从 JPEG 字节流按厂商分发解析 AF 框"""
+    try:
+        tiff_data = _exif_tiff_block(data)
+        if tiff_data is None:
             return []
-        idx = 2
-        while idx < len(data) - 4:
-            if data[idx] != 0xFF: break
-            marker = data[idx + 1]
-            if marker in (0xD9, 0xDA): break
-            length = int.from_bytes(data[idx + 2:idx + 4], 'big')
-            if marker == 0xE1:
-                body = data[idx + 4 : idx + 2 + length]
-                if body.startswith(b'Exif\x00\x00'):
-                    tiff_data = body[6:]
-                    endian = '<' if tiff_data[:2] == b'II' else ('>' if tiff_data[:2] == b'MM' else None)
-                    if endian:
-                        boxes = _canon_af_core(tiff_data, endian, orientation)
-                        if boxes:
-                            return boxes
-            idx += 2 + length
-        return []
+        if _makernote_vendor(tiff_data) == b'SONY':
+            boxes = _sony_af_core(tiff_data, '<', orientation)
+            if boxes:
+                return boxes
+        return _canon_af_core(tiff_data, '<' if tiff_data[:2] == b'II' else '>', orientation) or []
     except Exception:
         return []
 
-def extract_canon_af_points(file_path: str, orientation: int = 1) -> list:
-    """佳能 AF 框提取：JPEG 走 APP1；RAW (CR3/CR2) 优先解内嵌预览 JPEG 的 MakerNote
-    （CR3 独立块里的 AFInfo2 是新布局，内嵌预览里带的是已验证正确的经典布局）"""
+
+def extract_af_points(file_path: str, orientation: int = 1) -> list:
+    """【品牌无关】AF 对焦点提取总入口：支持佳能 EOS R / 索尼 α 系列。"""
     try:
         is_raw = is_raw_file(file_path)
         if is_raw:
-            # RAW：单趟缓存里的解析产物（内嵌预览 MakerNote 优先，CR3 独立块兜底，
-            # 方向与显示像素同源；CR3 存的是镜头畸变校正前坐标，径向偏移属物理存在）
             return list(_raw_bundle(file_path).get("af") or [])
 
         with open(file_path, 'rb') as f:
             data = f.read(250000)
-        if len(data) < 4:
-            return []
-        if data[:2] == b'\xFF\xD8':
-            return _af_from_jpeg_bytes(data, orientation)
-        return []
+        return _af_from_jpeg_bytes(data, orientation)
     except Exception:
         return []
+
+
+# 【核心兼容垫片】防止旧代码 / debug_focus.py 依赖原函数名报错
+extract_canon_af_points = extract_af_points
 
 def _canon_af_core(tiff_data: bytes, endian: str, orientation: int = 1) -> list:
     af_boxes = []
@@ -3148,20 +3224,24 @@ class SinglePhotoViewer(QWidget):
         else:
             self.btn_af_toggle.setStyleSheet(self._AF_BTN_INACTIVE)
         self.update()
+        
 
 # ==============================================================================
-# 暗房一键导出后台工作线程
+# 暗房一键导出后台工作线程 (支持开关、自定义文件夹名、SMB 分流)
 # ==============================================================================
 class DarkroomExportWorker(QThread):
     sig_progress = Signal(int, int, str)
     sig_finished = Signal(dict)
 
-    def __init__(self, all_photos: list, unhidden_photos: list, dest_dir: Path, raw_src_dir: Path):
+    def __init__(self, all_photos: list, unhidden_photos: list, dest_dir: Path, raw_src_dir: Path,
+                 config: dict, smb_dest_dir: Path = None):
         super().__init__()
         self.all_photos = all_photos
         self.unhidden_photos = unhidden_photos
         self.dest_dir = dest_dir
         self.raw_src_dir = raw_src_dir
+        self.config = config
+        self.smb_dest_dir = smb_dest_dir
 
     @staticmethod
     def normalize_stem(stem: str) -> str:
@@ -3176,21 +3256,39 @@ class DarkroomExportWorker(QThread):
 
     def run(self):
         start_time = time.time()
-        jpg_dir = self.dest_dir / "jpg"
-        jpg2_dir = self.dest_dir / "jpg2"
-        cr3_dir = self.dest_dir / "cr3"
 
-        jpg_dir.mkdir(parents=True, exist_ok=True)
-        jpg2_dir.mkdir(parents=True, exist_ok=True)
-        cr3_dir.mkdir(parents=True, exist_ok=True)
+        enable_all = self.config.get("enable_all_jpg", True)
+        name_all = self.config.get("name_all_jpg", "jpg").strip() or "jpg"
+        enable_sel = self.config.get("enable_selected_jpg", True)
+        name_sel = self.config.get("name_selected_jpg", "jpg2").strip() or "jpg2"
+        enable_raw = self.config.get("enable_raw", True)
+        name_raw = self.config.get("name_raw", "cr3").strip() or "cr3"
+        enable_smb = bool(self.smb_dest_dir)
 
-        total_steps = len(self.all_photos) + len(self.unhidden_photos) * 2
+        jpg_dir = self.dest_dir / name_all if enable_all else None
+        jpg2_dir = self.dest_dir / name_sel if enable_sel else None
+        cr3_dir = self.dest_dir / name_raw if enable_raw else None
+        smb_cr3_dir = self.smb_dest_dir / name_raw if enable_smb else None
+
+        if jpg_dir: jpg_dir.mkdir(parents=True, exist_ok=True)
+        if jpg2_dir: jpg2_dir.mkdir(parents=True, exist_ok=True)
+        if cr3_dir: cr3_dir.mkdir(parents=True, exist_ok=True)
+        if smb_cr3_dir:
+            try:
+                smb_cr3_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                smb_cr3_dir = None
+
+        total_steps = 0
+        if enable_all: total_steps += len(self.all_photos)
+        if enable_sel: total_steps += len(self.unhidden_photos)
+        if enable_raw or smb_cr3_dir: total_steps += len(self.unhidden_photos)
+
         cur_step = 0
         skipped_jpg_all = 0
         skipped_jpg2 = 0
 
         def _deliver_jpg(src: Path, dst_dir: Path, cur: int, total: int, tag: str) -> bool:
-            """jpg/jpg2 目录只交付 JPG：RAW-only 流程下，RAW 自动转出机内内嵌预览 (按 EXIF 方向转正)；普通图原样拷贝"""
             if is_raw_file(src):
                 img = load_photo_qimage(str(src))
                 if img.isNull():
@@ -3208,86 +3306,253 @@ class DarkroomExportWorker(QThread):
             shutil.copy2(src, dst_dir / src.name)
             return True
 
-        for p_str in self.all_photos:
-            src = Path(p_str)
-            cur_step += 1
-            if not _deliver_jpg(src, jpg_dir, cur_step, total_steps, "导出到 jpg"):
-                skipped_jpg_all += 1
+        if enable_all and jpg_dir:
+            for p_str in self.all_photos:
+                src = Path(p_str)
+                cur_step += 1
+                if not _deliver_jpg(src, jpg_dir, cur_step, total_steps, f"导出到 {name_all}"):
+                    skipped_jpg_all += 1
 
-        for p_str in self.unhidden_photos:
-            src = Path(p_str)
-            cur_step += 1
-            if not _deliver_jpg(src, jpg2_dir, cur_step, total_steps, "导出到 jpg2"):
-                skipped_jpg2 += 1
-
-        raw_index = {}
-        if self.raw_src_dir.exists() and self.raw_src_dir.is_dir():
-            for f in self.raw_src_dir.iterdir():
-                if f.is_file() and f.suffix.lower() in {".cr3", ".arw"}:
-                    key = self.normalize_stem(f.stem)
-                    raw_index[key] = f
+        if enable_sel and jpg2_dir:
+            for p_str in self.unhidden_photos:
+                src = Path(p_str)
+                cur_step += 1
+                if not _deliver_jpg(src, jpg2_dir, cur_step, total_steps, f"导出到 {name_sel}"):
+                    skipped_jpg2 += 1
 
         cr3_copied_count = 0
+        smb_copied_count = 0
         orphan_count = 0
-        for p_str in self.unhidden_photos:
-            src = Path(p_str)
-            cur_step += 1
-            if is_raw_file(src):
-                raw_file = src  # 选片本身就是 RAW（RAW 速览页进来的），直接归档
-            else:
-                raw_file = raw_index.get(self.normalize_stem(src.stem))
-            if raw_file:
-                self.sig_progress.emit(cur_step, total_steps, f"匹配生肉 RAW: {raw_file.name}")
-                shutil.copy2(raw_file, cr3_dir / raw_file.name)
-                cr3_copied_count += 1
-            else:
-                orphan_count += 1
+
+        if enable_raw or smb_cr3_dir:
+            raw_index = {}
+            if self.raw_src_dir.exists() and self.raw_src_dir.is_dir():
+                for f in self.raw_src_dir.iterdir():
+                    if f.is_file() and f.suffix.lower() in {".cr3", ".arw"}:
+                        key = self.normalize_stem(f.stem)
+                        raw_index[key] = f
+
+            for p_str in self.unhidden_photos:
+                src = Path(p_str)
+                cur_step += 1
+                if is_raw_file(src):
+                    raw_file = src
+                else:
+                    raw_file = raw_index.get(self.normalize_stem(src.stem))
+
+                if raw_file:
+                    self.sig_progress.emit(cur_step, total_steps, f"匹配生肉 RAW: {raw_file.name}")
+                    if cr3_dir:
+                        shutil.copy2(raw_file, cr3_dir / raw_file.name)
+                        cr3_copied_count += 1
+                    if smb_cr3_dir:
+                        try:
+                            shutil.copy2(raw_file, smb_cr3_dir / raw_file.name)
+                            smb_copied_count += 1
+                        except Exception:
+                            pass
+                else:
+                    orphan_count += 1
 
         elapsed = max(0.1, time.time() - start_time)
         self.sig_finished.emit({
-            "jpg_count": len(self.all_photos) - skipped_jpg_all,
-            "jpg2_count": len(self.unhidden_photos) - skipped_jpg2,
+            "dest_dir": str(self.dest_dir),
+            "smb_dest_dir": str(self.smb_dest_dir) if smb_cr3_dir else "",
+            "enable_all": enable_all,
+            "enable_sel": enable_sel,
+            "enable_raw": enable_raw,
+            "enable_smb": bool(smb_cr3_dir),
+            "name_all": name_all,
+            "name_sel": name_sel,
+            "name_raw": name_raw,
+            "jpg_count": (len(self.all_photos) - skipped_jpg_all) if enable_all else 0,
+            "jpg2_count": (len(self.unhidden_photos) - skipped_jpg2) if enable_sel else 0,
             "cr3_count": cr3_copied_count,
+            "smb_count": smb_copied_count,
             "orphan_count": orphan_count,
             "skipped_jpg": skipped_jpg_all + skipped_jpg2,
             "elapsed": elapsed
         })
 
-class ExportDialog(QDialog):
-    def __init__(self, parent=None, default_raw_dir=""):
+# ==============================================================================
+# 导出成功结果对话框 (支持一键原生打开本地 / 移动端目录)
+# ==============================================================================
+class ExportSuccessDialog(QDialog):
+    def __init__(self, res: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("暗房一键导出交付 (自动生成三大件)")
-        self.resize(520, 240)
+        self.res = res
+        self.setWindowTitle("🎉 导出交付完成")
+        self.resize(520, 320)
+        self.setStyleSheet("""
+            QDialog { background-color: #141418; color: #f4f4f5; }
+            QLabel { color: #e4e4e7; font-size: 13px; }
+            QPushButton {
+                background-color: #27272a;
+                border: 1px solid #3f3f46;
+                border-radius: 6px;
+                padding: 7px 16px;
+                font-weight: bold;
+                color: #ffffff;
+            }
+            QPushButton:hover { background-color: #3f3f46; border-color: #38bdf8; color: #38bdf8; }
+            QPushButton#PrimaryBtn { background-color: #0284c7; border: none; }
+            QPushButton#PrimaryBtn:hover { background-color: #0369a1; color: #ffffff; }
+        """)
+        self._init_ui()
+
+    def _init_ui(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 20, 20, 20)
+        v.setSpacing(14)
+
+        title = QLabel("✅ 选片交付任务已全自动执行完毕！")
+        title.setStyleSheet("font-size: 15px; font-weight: bold; color: #38bdf8;")
+        v.addWidget(title)
+
+        lines = []
+        if self.res.get("enable_all"):
+            lines.append(f"• 全量暗房 [{self.res['name_all']}]: 导出 {self.res['jpg_count']} 张")
+        if self.res.get("enable_sel"):
+            lines.append(f"• 精选出片 [{self.res['name_sel']}]: 导出 {self.res['jpg2_count']} 张")
+        if self.res.get("enable_raw"):
+            lines.append(f"• 生肉归档 [{self.res['name_raw']}]: 匹配写入 {self.res['cr3_count']} 张")
+        if self.res.get("enable_smb"):
+            lines.append(f"• 移动端修图分流: 同步投送 {self.res['smb_count']} 张纯 RAW")
+        if self.res.get("orphan_count", 0) > 0:
+            lines.append(f"• ⚠️ 缺失 RAW 孤儿图: {self.res['orphan_count']} 张")
+        if self.res.get("skipped_jpg", 0) > 0:
+            lines.append(f"• 跳过无预览 RAW: {self.res['skipped_jpg']} 张")
+        lines.append(f"• 总耗时: {self.res['elapsed']:.2f} 秒")
+
+        lbl_summary = QLabel("\n".join(lines))
+        lbl_summary.setStyleSheet("background-color: #18181e; border: 1px solid #27272f; border-radius: 6px; padding: 12px; font-family: Consolas, 'Segoe UI', monospace; line-height: 1.5;")
+        v.addWidget(lbl_summary)
+
+        v.addStretch()
+
+        btns = QHBoxLayout()
+        btns.setSpacing(10)
+
+        btn_open_local = QPushButton("📁 打开本地导出目录")
+        btn_open_local.setObjectName("PrimaryBtn")
+        btn_open_local.clicked.connect(self._open_local_dir)
+        btns.addWidget(btn_open_local)
+
+        if self.res.get("smb_dest_dir"):
+            btn_open_remote = QPushButton("📱 打开移动端共享目录")
+            btn_open_remote.clicked.connect(self._open_remote_dir)
+            btns.addWidget(btn_open_remote)
+
+        btns.addStretch()
+
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        btns.addWidget(btn_close)
+
+        v.addLayout(btns)
+
+    def _open_local_dir(self):
+        d = self.res.get("dest_dir", "")
+        if d and os.path.exists(d):
+            try:
+                os.startfile(d)
+            except Exception:
+                from PySide6.QtGui import QDesktopServices
+                from PySide6.QtCore import QUrl
+                QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+
+    def _open_remote_dir(self):
+        d = self.res.get("smb_dest_dir", "")
+        if d and os.path.exists(d):
+            try:
+                os.startfile(d)
+            except Exception:
+                from PySide6.QtGui import QDesktopServices
+                from PySide6.QtCore import QUrl
+                QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+
+
+# ==============================================================================
+# 暗房一键导出配置对话框 (自动建目录 + 根目录二合一 + 移动端修图分流)
+# ==============================================================================
+class ExportDialog(QDialog):
+    def __init__(self, parent=None, default_work_dir=""):
+        super().__init__(parent)
+        self.setWindowTitle("暗房一键导出交付 (自动建目录 + 移动端修图闭环)")
+        self.resize(580, 420)
         self.setStyleSheet("""
             QDialog { background-color: #18181b; color: #f4f4f5; }
-            QLabel { color: #e4e4e7; font-weight: bold; }
-            QLineEdit { background-color: #27272a; border: 1px solid #3f3f46; border-radius: 6px; padding: 6px; color: #fff; }
+            QLabel { color: #e4e4e7; font-weight: bold; font-size: 12px; }
+            QLineEdit { background-color: #27272a; border: 1px solid #3f3f46; border-radius: 6px; padding: 6px; color: #fff; font-size: 12px; }
+            QLineEdit:focus { border: 1px solid #38bdf8; background-color: #202028; }
             QPushButton { background-color: #27272a; border: 1px solid #3f3f46; border-radius: 6px; padding: 6px 14px; font-weight: bold; }
-            QPushButton:hover { background-color: #3f3f46; }
-            QPushButton#ActionBtn { background-color: #0284c7; color: white; border: none; padding: 8px 18px; }
+            QPushButton:hover { background-color: #3f3f46; border-color: #38bdf8; }
+            QPushButton#ActionBtn { background-color: #0284c7; color: white; border: none; padding: 8px 22px; font-size: 13px; }
             QPushButton#ActionBtn:hover { background-color: #0369a1; }
+            QCheckBox { color: #38bdf8; font-weight: bold; }
         """)
 
+        self.default_work_dir = default_work_dir
+        self.st = QSettings("AnicropGeeks", "AnicropStudio")
+        self._init_ui()
+
+    def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 18)
 
-        layout.addWidget(QLabel("📁 1. 导出目标文件夹 (自动创建 jpg / jpg2 / cr3；RAW 自动转为机内预览 JPG):"))
-        h1 = QHBoxLayout()
-        self.edit_dest = QLineEdit()
-        h1.addWidget(self.edit_dest)
-        btn_b1 = QPushButton("浏览...")
-        btn_b1.clicked.connect(self._browse_dest)
-        h1.addWidget(btn_b1)
-        layout.addLayout(h1)
+        # 1. 角色名（流萤等二次元角色）
+        layout.addWidget(QLabel("🏷️ 1. 角色文件夹名（或者coser老师的cv）:"))
+        self.edit_task_name = QLineEdit()
+        self.edit_task_name.setPlaceholderText("例如: 流萤")
+        self.edit_task_name.textChanged.connect(self._update_preview)
+        layout.addWidget(self.edit_task_name)
 
-        layout.addWidget(QLabel("📦 2. RAW 全量源目录 (默认已继承 P0.2 载入路径):"))
-        h2 = QHBoxLayout()
-        self.edit_raw = QLineEdit(default_raw_dir)
-        h2.addWidget(self.edit_raw)
-        btn_b2 = QPushButton("浏览...")
-        btn_b2.clicked.connect(self._browse_raw)
-        h2.addWidget(btn_b2)
-        layout.addLayout(h2)
+        # 2. 本地工作根目录 (2和3完美二合一：既是 RAW 源，也是导出分类根目录)
+        layout.addWidget(QLabel("📁 2. 本地工作根目录 (既包含全量 RAW 素材，也在此自动生成角色文件夹):"))
+        h_work = QHBoxLayout()
+        saved_work_dir = self.default_work_dir or self.st.value("last_work_root_dir", "")
+        self.edit_work_root = QLineEdit(saved_work_dir)
+        self.edit_work_root.setPlaceholderText("选择当前活动的总文件夹，如 E:\\Photos\\Bilibili World 2026")
+        self.edit_work_root.textChanged.connect(self._update_preview)
+        h_work.addWidget(self.edit_work_root)
+        btn_b_work = QPushButton("浏览...")
+        btn_b_work.clicked.connect(self._browse_work_root)
+        h_work.addWidget(btn_b_work)
+        layout.addLayout(h_work)
+
+        # 本地生成路径动态预览
+        self.lbl_preview_local = QLabel("👉 本地输出预览: 请输入角色名称")
+        self.lbl_preview_local.setStyleSheet("color: #38bdf8; font-size: 11px; font-family: Consolas, monospace;")
+        layout.addWidget(self.lbl_preview_local)
+
+        # 3. 移动端/iPad 修图路径 (本机作为服务机，直接投送到给 iPad 共享的物理路径)
+        remote_box = QFrame()
+        remote_box.setStyleSheet("QFrame { background-color: #141418; border: 1px solid #27272f; border-radius: 8px; padding: 10px; }")
+        remote_vlayout = QVBoxLayout(remote_box)
+        remote_vlayout.setSpacing(8)
+
+        self.cb_enable_remote = QCheckBox("📱 启用异地/移动端修图分流 (自动投送纯 RAW 供 iPad 像素蛋糕秒开)")
+        saved_remote_enabled = self.st.value("export_enable_remote", False, type=bool)
+        self.cb_enable_remote.setChecked(saved_remote_enabled)
+        self.cb_enable_remote.toggled.connect(self._on_remote_toggled)
+        remote_vlayout.addWidget(self.cb_enable_remote)
+
+        h_remote = QHBoxLayout()
+        saved_remote_path = self.st.value("export_remote_path", "")
+        self.edit_remote_path = QLineEdit(saved_remote_path)
+        self.edit_remote_path.setPlaceholderText("选择本机共享给 iPad 的修图根目录，如 D:\\iPad_Share")
+        self.edit_remote_path.textChanged.connect(self._update_preview)
+        h_remote.addWidget(self.edit_remote_path)
+        self.btn_b_remote = QPushButton("浏览...")
+        self.btn_b_remote.clicked.connect(self._browse_remote_path)
+        h_remote.addWidget(self.btn_b_remote)
+        remote_vlayout.addLayout(h_remote)
+
+        self.lbl_preview_remote = QLabel("👉 移动端同步预览: 未启用")
+        self.lbl_preview_remote.setStyleSheet("color: #a1a1aa; font-size: 11px; font-family: Consolas, monospace;")
+        remote_vlayout.addWidget(self.lbl_preview_remote)
+        layout.addWidget(remote_box)
 
         layout.addStretch()
 
@@ -3303,18 +3568,75 @@ class ExportDialog(QDialog):
         btns.addWidget(btn_ok)
         layout.addLayout(btns)
 
-    def _browse_dest(self):
-        d = QFileDialog.getExistingDirectory(self, "选择导出目标文件夹")
-        if d: self.edit_dest.setText(d)
+        self._on_remote_toggled(self.cb_enable_remote.isChecked())
+        self._update_preview()
 
-    def _browse_raw(self):
-        d = QFileDialog.getExistingDirectory(self, "选择 RAW 源目录")
-        if d: self.edit_raw.setText(d)
+    def _browse_work_root(self):
+        d = QFileDialog.getExistingDirectory(self, "选择本地工作根目录", self.edit_work_root.text() or "")
+        if d:
+            self.edit_work_root.setText(d)
+
+    def _browse_remote_path(self):
+        d = QFileDialog.getExistingDirectory(self, "选择移动端修图根目录", self.edit_remote_path.text() or "")
+        if d:
+            self.edit_remote_path.setText(d)
+
+    def _on_remote_toggled(self, checked: bool):
+        self.edit_remote_path.setEnabled(checked)
+        self.btn_b_remote.setEnabled(checked)
+        self._update_preview()
+
+    def _update_preview(self):
+        task = self.edit_task_name.text().strip() or "[角色名称]"
+        work_root = self.edit_work_root.text().strip()
+        if work_root:
+            p_local = Path(work_root) / task
+            self.lbl_preview_local.setText(f"👉 本地将自动创建: {p_local}")
+            self.lbl_preview_local.setStyleSheet("color: #38bdf8; font-size: 11px; font-family: Consolas, monospace;")
+        else:
+            self.lbl_preview_local.setText("👉 本地输出预览: 请指定工作根目录")
+            self.lbl_preview_local.setStyleSheet("color: #facc15; font-size: 11px;")
+
+        if self.cb_enable_remote.isChecked():
+            remote_root = self.edit_remote_path.text().strip()
+            if remote_root:
+                p_remote = Path(remote_root) / task
+                self.lbl_preview_remote.setText(f"👉 移动端将同步创建: {p_remote}")
+                self.lbl_preview_remote.setStyleSheet("color: #4ade80; font-size: 11px; font-family: Consolas, monospace;")
+            else:
+                self.lbl_preview_remote.setText("👉 移动端同步预览: 请指定移动端修图目录")
+                self.lbl_preview_remote.setStyleSheet("color: #facc15; font-size: 11px;")
+        else:
+            self.lbl_preview_remote.setText("👉 移动端同步预览: 未启用")
+            self.lbl_preview_remote.setStyleSheet("color: #71717a; font-size: 11px;")
 
     def _on_ok(self):
-        if not self.edit_dest.text().strip():
-            QMessageBox.warning(self, "缺失目标", "请指定导出目标文件夹！")
+        task = self.edit_task_name.text().strip()
+        work_root = self.edit_work_root.text().strip()
+
+        if not task:
+            QMessageBox.warning(self, "名称缺失", "请输入角色文件夹名！")
             return
+        if not work_root or not Path(work_root).exists():
+            QMessageBox.warning(self, "目录无效", "请指定有效的工作根目录！")
+            return
+
+        if self.cb_enable_remote.isChecked():
+            remote_root = self.edit_remote_path.text().strip()
+            if not remote_root or not Path(remote_root).exists():
+                QMessageBox.warning(self, "目录无效", "启用了移动端同步，但移动端修图目录不存在！")
+                return
+
+        # 持久化记忆
+        self.st.setValue("last_work_root_dir", work_root)
+        self.st.setValue("export_enable_remote", self.cb_enable_remote.isChecked())
+        if self.cb_enable_remote.isChecked():
+            self.st.setValue("export_remote_path", self.edit_remote_path.text().strip())
+
+        # 核心：dest_dir 与 raw_src_dir 逻辑闭环
+        self.final_dest_dir = Path(work_root) / task
+        self.final_raw_src_dir = Path(work_root)
+        self.final_smb_dest_dir = (Path(self.edit_remote_path.text().strip()) / task) if self.cb_enable_remote.isChecked() else None
         self.accept()
 
 # ==============================================================================
@@ -4000,6 +4322,7 @@ class DarkroomPageWidget(QWidget):
     sig_toggle_cinema_fullscreen = Signal()
     sig_selection_changed = Signal(str, int, int)
     sig_viewer_active = Signal(bool)
+    sig_return_to_gallery = Signal()  # 【新增】返回画廊主相册物理信号
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4021,23 +4344,54 @@ class DarkroomPageWidget(QWidget):
 
         self.stack = QStackedWidget()
 
-        self.dark_container = QWidget()
-        layout = QVBoxLayout(self.dark_container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        # 1. 大图检视器预先实例化（供顶部面板挂载控件）
+        self.photo_viewer = SinglePhotoViewer(self, is_darkroom=True, cull_mode=self.cull_mode)
+        self.photo_viewer.sig_back_to_gallery.connect(self._on_viewer_back)
+        self.photo_viewer.sig_toggle_cinema_fullscreen.connect(self.sig_toggle_cinema_fullscreen)
+        self.photo_viewer.sig_toggle_mark_requested.connect(self._on_viewer_toggle_hide)
+        self.photo_viewer.sig_filter_mode_toggled.connect(self._on_viewer_filter_mode_toggled)
+        self.photo_viewer.sig_photo_changed.connect(self.sig_selection_changed)
+        self.photo_viewer.sig_rating_requested.connect(self._on_viewer_rating_requested)
 
-        # 【暗房独立全宽顶部面板】
+        # 2. 暗房独立全宽顶部面板（支持画廊/大图双模式平滑切换）
         self.header_widget = QFrame()
         self.header_widget.setObjectName("DarkroomToolbar")
         self.header_widget.setStyleSheet("""
             QFrame#DarkroomToolbar {
                 background-color: #141418;
                 border-bottom: 1px solid #27272f;
-                padding: 6px 10px;
+                padding: 4px 6px;
             }
         """)
-        b_layout = QHBoxLayout(self.header_widget)
-        b_layout.setContentsMargins(12, 6, 12, 6)
+        h_vlayout = QVBoxLayout(self.header_widget)
+        h_vlayout.setContentsMargins(6, 4, 6, 4)
+        h_vlayout.setSpacing(0)
+
+        # ---------------- 模式 A: 暗房画廊模式顶栏 ----------------
+        self.gallery_bar = QWidget()
+        b_layout = QHBoxLayout(self.gallery_bar)
+        b_layout.setContentsMargins(0, 0, 0, 0)
+        b_layout.setSpacing(8)
+
+        # 【核心新增】一键返回画廊主相册物理按键，打通操作心流
+        self.btn_back_to_album = QPushButton("← 返回画廊相册")
+        self.btn_back_to_album.setStyleSheet("""
+            QPushButton {
+                background-color: #27272a;
+                border: 1px solid #3f3f46;
+                border-radius: 4px;
+                padding: 4px 12px;
+                font-weight: bold;
+                color: #38bdf8;
+            }
+            QPushButton:hover {
+                background-color: #3f3f46;
+                color: #ffffff;
+            }
+        """)
+        self.btn_back_to_album.setToolTip("返回漫展画廊初筛相册")
+        self.btn_back_to_album.clicked.connect(self.sig_return_to_gallery.emit)
+        b_layout.addWidget(self.btn_back_to_album)
 
         self.btn_remove_mode = QPushButton("🗑️ 移出照片")
         self.btn_remove_mode.setStyleSheet("font-weight: bold; padding: 4px 10px;")
@@ -4062,6 +4416,45 @@ class DarkroomPageWidget(QWidget):
         self.lbl_dark_stats = QLabel("暗房收录: 0 张")
         self.lbl_dark_stats.setStyleSheet("color: #a1a1aa; font-weight: bold;")
         b_layout.addWidget(self.lbl_dark_stats)
+
+        h_vlayout.addWidget(self.gallery_bar)
+
+        # ---------------- 模式 B: 暗房大图检视器专属顶栏 (36px 极客细轨) ----------------
+        self.viewer_bar = QWidget()
+        self.viewer_bar.setVisible(False)
+        self.viewer_bar.setFixedHeight(36)
+        self.viewer_layout = QHBoxLayout(self.viewer_bar)
+        self.viewer_layout.setContentsMargins(0, 0, 6, 0)
+        self.viewer_layout.setSpacing(0)
+
+        # 左侧：正方形撑满高度的物理返回按键 "<"
+        self.viewer_layout.addWidget(self.photo_viewer.btn_back)
+
+        # 避让左侧 250px 看板，中轴绝对对称
+        self.viewer_layout.addSpacing(240)
+        self.viewer_layout.addStretch(1)
+        self.viewer_layout.addWidget(self.photo_viewer.lbl_filename)
+        self.viewer_layout.addStretch(1)
+
+        # 右侧：满血接回胶囊工具组 (特写 / 对焦 / 对比 / 锁瞳徽标)
+        tool_capsule = QFrame()
+        tool_capsule.setStyleSheet("QFrame { background-color: #18181c; border: 1px solid #2e2e36; border-radius: 3px; }")
+        tool_capsule_l = QHBoxLayout(tool_capsule)
+        tool_capsule_l.setContentsMargins(2, 2, 2, 2)
+        tool_capsule_l.setSpacing(3)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_eye_zoom)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_af_toggle)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_compare)
+        tool_capsule_l.addWidget(self.photo_viewer.lbl_target_badge)
+        self.viewer_layout.addWidget(tool_capsule)
+
+        h_vlayout.addWidget(self.viewer_bar)
+
+        # 3. 暗房网格画廊容器
+        self.dark_container = QWidget()
+        layout = QVBoxLayout(self.dark_container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
         self.gallery = AdvancedGalleryView(self, is_darkroom=True, cull_mode=self.cull_mode)
         self.gallery.setModel(self.model)
@@ -4109,14 +4502,6 @@ class DarkroomPageWidget(QWidget):
 
         layout.addWidget(bottom_bar)
         self.stack.addWidget(self.dark_container)
-
-        self.photo_viewer = SinglePhotoViewer(self, is_darkroom=True, cull_mode=self.cull_mode)
-        self.photo_viewer.sig_back_to_gallery.connect(self._on_viewer_back)
-        self.photo_viewer.sig_toggle_cinema_fullscreen.connect(self.sig_toggle_cinema_fullscreen)
-        self.photo_viewer.sig_toggle_mark_requested.connect(self._on_viewer_toggle_hide)
-        self.photo_viewer.sig_filter_mode_toggled.connect(self._on_viewer_filter_mode_toggled)
-        self.photo_viewer.sig_photo_changed.connect(self.sig_selection_changed)
-        self.photo_viewer.sig_rating_requested.connect(self._on_viewer_rating_requested)
         self.stack.addWidget(self.photo_viewer)
 
         root_layout.addWidget(self.stack)
@@ -4124,7 +4509,6 @@ class DarkroomPageWidget(QWidget):
     def load_from_gallery(self, selected_paths: list, thumb_cache: dict, source_dir: str):
         existing_set = set(self.all_darkroom_photos)
         new_photos = [p for p in selected_paths if p not in existing_set]
-        # 增量汇流：老选片完好无损，新选片无缝追加进来！
         self.all_darkroom_photos = list(self.all_darkroom_photos) + new_photos
         self.p02_source_dir = source_dir
         self.gallery.delegate.thumb_cache.update(thumb_cache)
@@ -4147,7 +4531,6 @@ class DarkroomPageWidget(QWidget):
             self.btn_clear_darkroom.setVisible(False)
             self.btn_remove_mode.setText("🗑️ 移出照片")
             self.btn_remove_mode.setStyleSheet("font-weight: bold; padding: 4px 10px;")
-            # 【批量移出】退出模式时把本次打标的待移出照片一次性剔除（不碰硬盘原图）
             if delegate.remove_set:
                 doomed = set(delegate.remove_set)
                 self.all_darkroom_photos = [p for p in self.all_darkroom_photos if p not in doomed]
@@ -4158,8 +4541,6 @@ class DarkroomPageWidget(QWidget):
         self.gallery.viewport().update()
 
     def _clear_darkroom_all(self):
-        """彻底清空暗房：清单/压暗状态/选中态 + QSettings 会话 + _darkroom_restore 缓存目录。
-        不碰硬盘原图。调用方负责前置确认。"""
         self.all_darkroom_photos.clear()
         self.gallery.delegate.hidden_set.clear()
         self.gallery.delegate.selected_set.clear()
@@ -4180,7 +4561,6 @@ class DarkroomPageWidget(QWidget):
         self._refresh_darkroom_view()
 
     def _on_clear_darkroom(self):
-        """一键清空暗房：弹确认提示框，确认后移出全部照片（不碰硬盘原图）"""
         total = len(self.all_darkroom_photos)
         if total == 0:
             return
@@ -4193,10 +4573,8 @@ class DarkroomPageWidget(QWidget):
             return
         self._clear_darkroom_all()
 
-    # ---- 退出拦截：暗房非空时弹窗询问是否清空 ----
     def showEvent(self, event):
         super().showEvent(event)
-        # 暗房页是主窗口子组件，closeEvent 收不到——给顶层窗口装事件过滤器（只装一次）
         if not getattr(self, "_exit_filter_installed", False):
             win = self.window()
             if win is not None and win is not self:
@@ -4221,8 +4599,7 @@ class DarkroomPageWidget(QWidget):
                     event.ignore()
                     return True
                 if clicked is btn_clear:
-                    self._clear_darkroom_all()  # 清空暗房并连带清空其缓存
-                # 保留现场：什么都不做，QSettings 会话已随操作实时落盘，下次启动无缝续修
+                    self._clear_darkroom_all()
         return super().eventFilter(obj, event)
 
     def _on_badge_clicked(self, file_path: str, action: str):
@@ -4266,14 +4643,12 @@ class DarkroomPageWidget(QWidget):
         self._save_session()
 
     def _save_session(self):
-        """暗房会话全量落盘: 照片清单 + 压暗/点亮状态 + 来源目录，下次启动无缝续修"""
         settings = QSettings("AnicropGeeks", "AnicropStudio")
         settings.setValue("darkroom_photos", self.all_darkroom_photos)
         settings.setValue("darkroom_hidden", list(self.gallery.delegate.hidden_set))
         settings.setValue("darkroom_source_dir", self.p02_source_dir)
 
     def restore_session(self):
-        """启动时恢复上次暗房现场: 清单/状态/来源目录 + 后台重建缩略图"""
         settings = QSettings("AnicropGeeks", "AnicropStudio")
         photos = settings.value("darkroom_photos", []) or []
         hidden = settings.value("darkroom_hidden", []) or []
@@ -4287,7 +4662,6 @@ class DarkroomPageWidget(QWidget):
         self.p02_source_dir = settings.value("darkroom_source_dir", "")
         keep = set(photos)
         self.gallery.delegate.hidden_set = {p for p in hidden if p in keep}
-        # 恢复出非空暗房后，即便用户没切到暗房页，退出拦截也要就位
         if not getattr(self, "_exit_filter_installed", False):
             win = self.window()
             if win is not None and win is not self:
@@ -4301,7 +4675,7 @@ class DarkroomPageWidget(QWidget):
         pool = QThreadPool.globalInstance()
         for p_str in photos:
             task = ThumbnailTask(p_str, cache_dir)
-            task.setAutoDelete(False)  # 防 C++/GC 双重析构竞态
+            task.setAutoDelete(False)
             self._restore_tasks = getattr(self, "_restore_tasks", set())
             self._restore_tasks.add(task)
             task.signals.loaded.connect(self._on_restore_thumb)
@@ -4310,7 +4684,6 @@ class DarkroomPageWidget(QWidget):
 
     def _on_restore_thumb(self, file_path: str, qimage: QImage):
         self.gallery.delegate.thumb_cache[file_path] = QPixmap.fromImage(qimage)
-        # 重绘合并：恢复缩略图逐张到图，80ms 合并成一帧，避免事件队列被打爆
         if not getattr(self, "_restore_repaint_timer", None):
             self._restore_repaint_timer = QTimer(self)
             self._restore_repaint_timer.setSingleShot(True)
@@ -4364,6 +4737,9 @@ class DarkroomPageWidget(QWidget):
             is_marked=is_marked
         )
 
+        # 【核心切换】隐藏画廊工具栏，点亮大图检视顶栏细轨（含返回键与胶囊）
+        self.gallery_bar.setVisible(False)
+        self.viewer_bar.setVisible(True)
         self.stack.setCurrentIndex(1)
         self.sig_viewer_active.emit(True)
         self.photo_viewer.setFocus()
@@ -4417,6 +4793,9 @@ class DarkroomPageWidget(QWidget):
         self._refresh_darkroom_view()
 
     def _on_viewer_back(self, return_index: int):
+        # 【核心切换】从大图退回时，恢复画廊工具栏，隐藏检视细轨
+        self.gallery_bar.setVisible(True)
+        self.viewer_bar.setVisible(False)
         self.stack.setCurrentIndex(0)
         self.sig_viewer_active.emit(False)
         self._refresh_darkroom_view()
@@ -4431,18 +4810,26 @@ class DarkroomPageWidget(QWidget):
             return
 
         settings = QSettings("AnicropGeeks", "AnicropStudio")
-        default_raw_candidate = self.p02_source_dir or settings.value("last_raw_source_dir", "")
+        default_work_candidate = self.p02_source_dir or settings.value("last_work_root_dir", "") or settings.value("last_raw_source_dir", "")
 
-        dlg = ExportDialog(self, default_raw_dir=default_raw_candidate)
+        dlg = ExportDialog(self, default_work_dir=default_work_candidate)
         if dlg.exec() == QDialog.Accepted:
-            dest_dir = Path(dlg.edit_dest.text().strip())
-            raw_src_dir = Path(dlg.edit_raw.text().strip())
+            dest_dir = dlg.final_dest_dir
+            raw_src_dir = dlg.final_raw_src_dir
+            smb_dest_dir = dlg.final_smb_dest_dir
 
-            settings.setValue("last_raw_source_dir", str(raw_src_dir))
+            export_config = {
+                "enable_all_jpg": settings.value("export_enable_all_jpg", True, type=bool),
+                "name_all_jpg": str(settings.value("export_name_all_jpg", "jpg")),
+                "enable_selected_jpg": settings.value("export_enable_selected_jpg", True, type=bool),
+                "name_selected_jpg": str(settings.value("export_name_selected_jpg", "jpg2")),
+                "enable_raw": settings.value("export_enable_raw", True, type=bool),
+                "name_raw": str(settings.value("export_name_raw", "cr3")),
+            }
 
             self.progress_dlg = QDialog(self)
             self.progress_dlg.setWindowTitle("正在执行暗房导出交付...")
-            self.progress_dlg.resize(420, 120)
+            self.progress_dlg.resize(440, 120)
             p_layout = QVBoxLayout(self.progress_dlg)
             self.lbl_export_status = QLabel("正在初始化输出目录...")
             p_layout.addWidget(self.lbl_export_status)
@@ -4454,7 +4841,9 @@ class DarkroomPageWidget(QWidget):
                 all_photos=self.all_darkroom_photos,
                 unhidden_photos=unhidden_list,
                 dest_dir=dest_dir,
-                raw_src_dir=raw_src_dir
+                raw_src_dir=raw_src_dir,
+                config=export_config,
+                smb_dest_dir=smb_dest_dir
             )
             self.export_worker.sig_progress.connect(self._on_export_progress)
             self.export_worker.sig_finished.connect(self._on_export_finished)
@@ -4467,16 +4856,9 @@ class DarkroomPageWidget(QWidget):
 
     def _on_export_finished(self, res: dict):
         self.progress_dlg.close()
-        msg = (
-            f"🎉 暗房三大件已全量自动交付：\n\n"
-            f"• jpg/ (粗选全量): 导出 {res['jpg_count']} 张\n"
-            f"• jpg2/ (精选出片): 导出 {res['jpg2_count']} 张\n"
-            f"• cr3/ (生肉匹配): 成功提取 {res['cr3_count']} 张\n"
-            f"• 未找到 RAW 孤儿数: {res['orphan_count']} 张\n"
-            + (f"• 跳过无预览 RAW: {res['skipped_jpg']} 张\n" if res.get('skipped_jpg', 0) > 0 else "")
-            + f"• 耗时: {res['elapsed']:.2f} 秒"
-        )
-        QMessageBox.information(self, "导出交付成功", msg)
+        dlg = ExportSuccessDialog(res, self)
+        dlg.exec()
+
 
 class RawGalleryPageWidget(AlbumPageWidget):
     """🎞️ RAW 速览画廊：与漫展画廊完全同构（排序/打星/对比/暗房交付），

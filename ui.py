@@ -465,10 +465,171 @@ class SettingsPageWidget(QWidget):
         hint3.setStyleSheet("color: #71717a; font-size: 11px;")
         gp_layout.addWidget(hint3)
 
+# ---------------- 导出规则与命名自定义 (修复 QSS 污染 + 支持默认路径) ----------------
+        gp_layout.addWidget(QLabel("📦 5. 暗房导出规则、命名定制与默认路径:"))
+        
+        export_box = QFrame()
+        export_box.setObjectName("ExportBox")
+        export_box.setStyleSheet("""
+            QFrame#ExportBox {
+                background-color: #18181e;
+                border: 1px solid #27272f;
+                border-radius: 8px;
+                padding: 14px;
+            }
+            QFrame#ExportBox QLabel {
+                border: none;
+                background: transparent;
+                color: #e4e4e7;
+                font-size: 12px;
+                padding: 0px;
+            }
+            QFrame#ExportBox QCheckBox {
+                border: none;
+                background: transparent;
+                color: #f4f4f5;
+                font-size: 12px;
+                font-weight: 500;
+                min-height: 26px;
+                padding: 0px;
+            }
+            QFrame#ExportBox QLineEdit {
+                background-color: #141418;
+                border: 1px solid #3f3f46;
+                border-radius: 4px;
+                padding: 5px 8px;
+                color: #ffffff;
+                font-size: 12px;
+                min-height: 22px;
+            }
+            QFrame#ExportBox QLineEdit:focus {
+                border: 1px solid #38bdf8;
+                background-color: #1a1a22;
+            }
+            QFrame#ExportBox QPushButton {
+                background-color: #27272a;
+                border: 1px solid #3f3f46;
+                border-radius: 4px;
+                padding: 5px 12px;
+                font-size: 12px;
+                font-weight: bold;
+                color: #e4e4e7;
+                min-height: 22px;
+            }
+            QFrame#ExportBox QPushButton:hover {
+                background-color: #3f3f46;
+                color: #38bdf8;
+            }
+        """)
+        eb_layout = QVBoxLayout(export_box)
+        eb_layout.setSpacing(12)
+
+        # 1. 文件夹开关与命名
+        h_exp1 = QHBoxLayout()
+        self.cb_exp_all = QCheckBox("导出完整暗房全量照片 (粗选全量)")
+        h_exp1.addWidget(self.cb_exp_all)
+        h_exp1.addStretch()
+        h_exp1.addWidget(QLabel("文件夹名:"))
+        self.edit_name_all = QLineEdit("jpg")
+        self.edit_name_all.setFixedWidth(110)
+        h_exp1.addWidget(self.edit_name_all)
+        eb_layout.addLayout(h_exp1)
+
+        h_exp2 = QHBoxLayout()
+        self.cb_exp_sel = QCheckBox("导出精选出片照片 (未隐藏/已点亮)")
+        h_exp2.addWidget(self.cb_exp_sel)
+        h_exp2.addStretch()
+        h_exp2.addWidget(QLabel("文件夹名:"))
+        self.edit_name_sel = QLineEdit("jpg2")
+        self.edit_name_sel.setFixedWidth(110)
+        h_exp2.addWidget(self.edit_name_sel)
+        eb_layout.addLayout(h_exp2)
+
+        h_exp3 = QHBoxLayout()
+        self.cb_exp_raw = QCheckBox("导出匹配 RAW 生肉 (CR3/ARW)")
+        h_exp3.addWidget(self.cb_exp_raw)
+        h_exp3.addStretch()
+        h_exp3.addWidget(QLabel("文件夹名:"))
+        self.edit_name_raw = QLineEdit("cr3")
+        self.edit_name_raw.setFixedWidth(110)
+        h_exp3.addWidget(self.edit_name_raw)
+        eb_layout.addLayout(h_exp3)
+
+        # 分割线
+        sep_exp = QFrame()
+        sep_exp.setFrameShape(QFrame.HLine)
+        sep_exp.setStyleSheet("border-top: 1px solid #27272f; max-height: 1px;")
+        eb_layout.addWidget(sep_exp)
+
+        # 2. 默认工作根目录路径 (本地)
+        eb_layout.addWidget(QLabel("📁 默认本地工作根目录 (包含全量 RAW 素材，导出时默认选中):"))
+        h_def_work = QHBoxLayout()
+        self.edit_def_work_dir = QLineEdit()
+        self.edit_def_work_dir.setPlaceholderText("留空则每次手动选择...")
+        h_def_work.addWidget(self.edit_def_work_dir)
+        btn_b_def_work = QPushButton("浏览...")
+        h_def_work.addWidget(btn_b_def_work)
+        eb_layout.addLayout(h_def_work)
+
+        # 3. 默认移动端修图根目录 (iPad)
+        eb_layout.addWidget(QLabel("📱 默认移动端/异地修图根目录 (本机共享给 iPad 的目录，导出时默认选中):"))
+        h_def_remote = QHBoxLayout()
+        self.edit_def_remote_dir = QLineEdit()
+        self.edit_def_remote_dir.setPlaceholderText("留空则不默认填入，如 D:\\iPad_Share...")
+        h_def_remote.addWidget(self.edit_def_remote_dir)
+        btn_b_def_remote = QPushButton("浏览...")
+        h_def_remote.addWidget(btn_b_def_remote)
+        eb_layout.addLayout(h_def_remote)
+
+        hint_exp = QLabel("💡 提示：取消勾选则导出时不生成该项；名字与默认路径可随时定制并即时记忆。")
+        hint_exp.setStyleSheet("color: #71717a; font-size: 11px;")
+        eb_layout.addWidget(hint_exp)
+
+        gp_layout.addWidget(export_box)
+
+        # 持久化读取与绑定
+        _st_exp = QSettings("AnicropGeeks", "AnicropStudio")
+        self.cb_exp_all.setChecked(_st_exp.value("export_enable_all_jpg", True, type=bool))
+        self.edit_name_all.setText(str(_st_exp.value("export_name_all_jpg", "jpg")))
+        self.cb_exp_sel.setChecked(_st_exp.value("export_enable_selected_jpg", True, type=bool))
+        self.edit_name_sel.setText(str(_st_exp.value("export_name_selected_jpg", "jpg2")))
+        self.cb_exp_raw.setChecked(_st_exp.value("export_enable_raw", True, type=bool))
+        self.edit_name_raw.setText(str(_st_exp.value("export_name_raw", "cr3")))
+        self.edit_def_work_dir.setText(str(_st_exp.value("last_work_root_dir", "")))
+        self.edit_def_remote_dir.setText(str(_st_exp.value("export_remote_path", "")))
+
+        self.cb_exp_all.toggled.connect(lambda v: QSettings("AnicropGeeks", "AnicropStudio").setValue("export_enable_all_jpg", v))
+        self.edit_name_all.textChanged.connect(lambda v: QSettings("AnicropGeeks", "AnicropStudio").setValue("export_name_all_jpg", v.strip() or "jpg"))
+        self.cb_exp_sel.toggled.connect(lambda v: QSettings("AnicropGeeks", "AnicropStudio").setValue("export_enable_selected_jpg", v))
+        self.edit_name_sel.textChanged.connect(lambda v: QSettings("AnicropGeeks", "AnicropStudio").setValue("export_name_selected_jpg", v.strip() or "jpg2"))
+        self.cb_exp_raw.toggled.connect(lambda v: QSettings("AnicropGeeks", "AnicropStudio").setValue("export_enable_raw", v))
+        self.edit_name_raw.textChanged.connect(lambda v: QSettings("AnicropGeeks", "AnicropStudio").setValue("export_name_raw", v.strip() or "cr3"))
+
+        self.edit_def_work_dir.textChanged.connect(lambda v: QSettings("AnicropGeeks", "AnicropStudio").setValue("last_work_root_dir", v.strip()))
+        self.edit_def_remote_dir.textChanged.connect(lambda v: QSettings("AnicropGeeks", "AnicropStudio").setValue("export_remote_path", v.strip()))
+
+        def _on_browse_def_work():
+            d = QFileDialog.getExistingDirectory(self, "选择默认本地工作根目录", self.edit_def_work_dir.text() or "")
+            if d:
+                self.edit_def_work_dir.setText(d)
+        btn_b_def_work.clicked.connect(_on_browse_def_work)
+
+        def _on_browse_def_remote():
+            d = QFileDialog.getExistingDirectory(self, "选择默认移动端修图根目录", self.edit_def_remote_dir.text() or "")
+            if d:
+                self.edit_def_remote_dir.setText(d)
+        btn_b_def_remote.clicked.connect(_on_browse_def_remote)
+
         g_layout.addWidget(group_pref)
         g_layout.addStretch()
 
-        self.settings_tabs.addTab(general_page, "常规偏好")
+        # ---------------- 给常规设置套上优雅的平滑滚动条 ----------------
+        from PySide6.QtWidgets import QScrollArea
+        scroll_general = QScrollArea()
+        scroll_general.setWidgetResizable(True)
+        scroll_general.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll_general.setWidget(general_page)
+        self.settings_tabs.addTab(scroll_general, "常规偏好")
 
         # ---------------- 子页 2: RAW 分流调度工具 ----------------
         sorter_page = self._build_sorter_tab()
@@ -1000,6 +1161,7 @@ class MainWindow(QMainWindow):
         self.page_darkroom = DarkroomPageWidget()
         self.page_darkroom.sig_selection_changed.connect(self._on_photo_selected)
         self.page_darkroom.sig_toggle_cinema_fullscreen.connect(self._toggle_cinema_fullscreen)
+        self.page_darkroom.sig_return_to_gallery.connect(lambda: self._switch_tab(0))  # 【核心打通】点击返回画廊直接跳回 Tab 0
         self.stack.addWidget(self.page_darkroom)
 
         # Page 2: 系统偏好设置
