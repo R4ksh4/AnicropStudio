@@ -5,9 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    #随包带上 SCRFD-10G 人脸检测权重：代码在 assets/det_10g.onnx 缺失时会自动下载，
-    # 打进包里可避免首次启动卡在 16MB 网络下载上。
-    datas=[('assets/det_10g.onnx', 'assets')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
