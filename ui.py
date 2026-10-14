@@ -1,3 +1,4 @@
+from watermark_ui import WatermarkPageWidget
 from boot_flash import BootFlash
 import sys
 import os
@@ -1034,14 +1035,13 @@ class MainWindow(QMainWindow):
         top_nav_layout.addWidget(self.btn_tab_darkroom)
 
         self.btn_tab_watermark = QPushButton("🏷️ 参数画框水印")
-        self.btn_tab_watermark.setProperty("class", "NavTab NavTabDisabled")
-        self.btn_tab_watermark.setEnabled(False)
-        self.btn_tab_watermark.setToolTip("Alpha 1.1 即将解锁")
+        self.btn_tab_watermark.setProperty("class", "NavTab")
+        self.btn_tab_watermark.clicked.connect(lambda: self._switch_tab(2))
         top_nav_layout.addWidget(self.btn_tab_watermark)
 
         self.btn_tab_settings = QPushButton("⚙️ 系统偏好设置")
         self.btn_tab_settings.setProperty("class", "NavTab")
-        self.btn_tab_settings.clicked.connect(lambda: self._switch_tab(2))
+        self.btn_tab_settings.clicked.connect(lambda: self._switch_tab(3))
         top_nav_layout.addWidget(self.btn_tab_settings)
 
         top_nav_layout.addStretch()
@@ -1161,14 +1161,17 @@ class MainWindow(QMainWindow):
         self.page_darkroom = DarkroomPageWidget()
         self.page_darkroom.sig_selection_changed.connect(self._on_photo_selected)
         self.page_darkroom.sig_toggle_cinema_fullscreen.connect(self._toggle_cinema_fullscreen)
-        self.page_darkroom.sig_return_to_gallery.connect(lambda: self._switch_tab(0))  # 【核心打通】点击返回画廊直接跳回 Tab 0
+        self.page_darkroom.sig_return_to_gallery.connect(lambda: self._switch_tab(0))
         self.stack.addWidget(self.page_darkroom)
 
-        # Page 2: 系统偏好设置
+        # Page 2: 参数画框水印工作台 (独立模块)
+        self.page_watermark = WatermarkPageWidget()
+        self.stack.addWidget(self.page_watermark)
+
+        # Page 3: 系统偏好设置
         self.page_settings = SettingsPageWidget()
         self.page_settings.sig_default_path_changed.connect(self._on_default_path_updated)
         self.stack.addWidget(self.page_settings)
-
         self.body_layout.addWidget(self.stack, stretch=1)
 
         # 全宽工具面板挂载
@@ -1223,16 +1226,16 @@ class MainWindow(QMainWindow):
         else:
             self.toolbar_stack.setVisible(False)
 
-        tabs = [self.btn_tab_album, self.btn_tab_darkroom, self.btn_tab_settings]
+        tabs = [self.btn_tab_album, self.btn_tab_darkroom, self.btn_tab_watermark, self.btn_tab_settings]
         for i, b in enumerate(tabs):
             b.setProperty("class", "NavTab NavTabActive" if i == index else "NavTab")
             b.style().polish(b)
 
         self.exif_group.setVisible(index in (0, 1))
 
-        title_map = {0: "🖼️ 漫展画廊初筛", 1: "🧪 极客暗房工坊", 2: "⚙️ 系统全局偏好"}
+        title_map = {0: "🖼️ 漫展画廊初筛", 1: "🧪 极客暗房工坊", 2: "🏷️ 参数画框工作台", 3: "⚙️ 系统全局偏好"}
         self.rail_title.setText(title_map.get(index, "📌 空间看板"))
-
+        
     def _on_photo_selected(self, file_path: str, idx: int, total: int):
         exif = parse_photo_exif(file_path)
         self.lbl_exif_camera.setText(exif['camera'])
