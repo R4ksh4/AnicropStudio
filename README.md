@@ -117,6 +117,12 @@ numpy>=1.24.0
 
 *(部分键位可在「系统偏好设置 → 快捷键映射」面板中自由改绑 A~Z 字母键)*
 
+
+### 🏷️ 品牌 Logo 插槽使用说明 (BYOA 机制)
+为规避商业商标侵权风险，本仓库与便携包**不内置附带任何相机品牌的官方商标图片文件**。
+- **开箱即用**：未放置外部图标时，系统将自动以极简、高保真的无衬线字体优雅呈现品牌标牌；
+- **自选装配**：若需要原厂高清透明 Logo，推荐前往开源项目 [howillli/photo-watermark](https://github.com/howillli/photo-watermark) 下载各品牌切片图片，将其命名为 `canon.png`、`sony.png`、`nikon.png` 等丢入 `assets/logos/` 文件夹（或在面板中手动点击“浏览”选取任意自制水印），系统即可自动无损换装！
+
 ## 致谢与社区贡献 (Special Thanks)
 
 - 感谢 **[@ENRIN233](https://github.com/ENRIN233)** 提交的 Pull Request，为本项目开拓了索尼 (Sony) α 系列相机对焦点解析的核心代码！
