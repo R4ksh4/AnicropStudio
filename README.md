@@ -3,6 +3,12 @@
 > ⚡ **专为二次元漫展返图流打造的高速极客工作台**  
 > 运行环境：Windows 10 / 11 x64（原生暗色模式 / 纯代码渲染） | 交付形态：绿色免安装便携版
 
+
+## （点击图片打开视频介绍）
+[![Anicrop Studio 视频介绍](https://i0.hdslb.com/bfs/archive/b9914072df833f3258d05afbed016566a7a98246.jpg@672w_378h_1c.webp)](https://www.bilibili.com/video/BV1P7pU6vEKb)
+
+
+
 ---
 
 ## 为什么会有这个项目？
