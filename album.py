@@ -62,10 +62,53 @@ RAW_IMAGE_EXTS = {".cr3", ".cr2", ".arw", ".nef", ".dng", ".orf", ".rw2"}
 def is_raw_file(file_path: str) -> bool:
     return Path(file_path).suffix.lower() in RAW_IMAGE_EXTS
 
-def _scan_embedded_jpeg(data: bytes) -> bytes:
-    """【不解析 RAW】直接在二进制流中扫描内嵌 JPEG (FFD8FF...FFD9)，取体积最大的一段
-    ——即机内全尺寸预览（佳能 CR3/CR2、索尼 ARW、尼康 NEF 均内嵌）。
+def _extract_cr2_embedded_jpeg(data: bytes) -> bytes:
     """
+    佳能 CR2 (Canon RAW v2) 全尺寸满血原图定点提取引擎
+    佳能 5D3 / 5D4 / 6D 核心机理:
+      IFD0 (固定偏移 16) 下的 Tag 0x0111 (StripOffsets) 和 Tag 0x0117 (StripByteCounts)
+      存储的正是 5760x3840 的全尺寸满血大图 (PreviewImage，体积通常 1MB~3.5MB)！
+    """
+    if len(data) < 64 or data[:4] != b'II*\x00' or data[8:12] != b'CR\x02\x00':
+        return b""
+
+    endian = '<'
+    try:
+        ifd0_off = struct.unpack(endian + 'I', data[4:8])[0]
+        if ifd0_off <= 0 or ifd0_off + 2 > len(data):
+            return b""
+
+        num_entries = struct.unpack(endian + 'H', data[ifd0_off : ifd0_off + 2])[0]
+        if num_entries <= 0 or ifd0_off + 2 + num_entries * 12 > len(data):
+            return b""
+
+        t_off, t_len = 0, 0
+        for i in range(min(num_entries, 60)):
+            ep = ifd0_off + 2 + i * 12
+            tag = struct.unpack(endian + 'H', data[ep : ep + 2])[0]
+            val = struct.unpack(endian + 'I', data[ep + 8 : ep + 12])[0]
+            if tag == 0x0111:      # StripOffsets (5760x3840 满血大图起始偏移)
+                t_off = val
+            elif tag == 0x0117:    # StripByteCounts (大图字节长度)
+                t_len = val
+
+        if t_off > 0 and t_len > 1024 and t_off + t_len <= len(data):
+            cand = data[t_off : t_off + t_len]
+            if cand.startswith(b'\xff\xd8'):
+                return cand
+    except Exception:
+        pass
+
+    return b""
+
+
+def _scan_embedded_jpeg(data: bytes) -> bytes:
+    """【不解析 RAW】直接在二进制流中扫描内嵌 JPEG。对 CR2 走定点解剖，其他走最长段扫描。"""
+    # 优先拦截佳能单反 CR2，毫秒级提取 IFD1 标准预览
+    cr2_preview = _extract_cr2_embedded_jpeg(data)
+    if cr2_preview:
+        return cr2_preview
+
     best = b""
     pos = 0
     n = len(data)
@@ -289,17 +332,61 @@ def _raw_bundle(file_path: str, light: bool = False) -> dict:
             if m:
                 bundle["rating"] = max(0, min(5, int(m.group(1))))
 
+        # 1. 优先检查同名 .xmp 伴侣文件 (Lightroom / Bridge / 达芬奇互通)
+        if bundle["rating"] == 0:
+            p_raw = Path(file_path)
+            for sidecar in (p_raw.with_suffix('.xmp'), p_raw.with_suffix('.XMP'), p_raw.parent / (p_raw.name + '.xmp')):
+                if sidecar.exists():
+                    try:
+                        s_txt = sidecar.read_bytes()
+                        m = re.search(rb'xmp:Rating\s*=\s*"\s*(-?\d)\s*"', s_txt) or \
+                            re.search(rb'<xmp:Rating>\s*(-?\d)\s*</xmp:Rating>', s_txt)
+                        if m:
+                            bundle["rating"] = max(0, min(5, int(m.group(1))))
+                            break
+                    except Exception:
+                        pass
+
+        # 2. 索尼微单硬件级绝杀：解剖 Sony MakerNote Tag 0x2002 (机身回放打星)
+        if bundle["rating"] == 0 and file_path.lower().endswith('.arw'):
+            pos = 0
+            while True:
+                idx_sony = data.find(b'SONY DSC', pos, min(len(data), 4 * 1024 * 1024))
+                if idx_sony == -1:
+                    break
+                if idx_sony + 14 <= len(data):
+                    cnt = struct.unpack_from('<H', data, idx_sony + 12)[0]
+                    if 0 < cnt <= 512:
+                        for i in range(cnt):
+                            ep = idx_sony + 14 + i * 12
+                            if ep + 12 > len(data):
+                                break
+                            tag = struct.unpack_from('<H', data, ep)[0]
+                            if tag == 0x2002:
+                                r_val = struct.unpack_from('<I', data, ep + 8)[0]
+                                if 1 <= r_val <= 5:
+                                    bundle["rating"] = r_val
+                                    break
+                        if bundle["rating"] > 0:
+                            break
+                pos = idx_sony + 8
+
+        cands = list(_iter_raw_tiff_candidates(data))
+        is_tiff_raw = file_path.lower().endswith(('.arw', '.cr2', '.nef', '.dng'))
+        if is_tiff_raw:
+            # 原生 TIFF 架构 (ARW/CR2/NEF/DNG): 容器 IFD0 记录真实物理陀螺仪方向
+            c_orient = _orientation_from_candidates(cands)
+            bundle["orientation"] = c_orient if c_orient in (1, 2, 3, 4, 6, 8) else 1
+        else:
+            orient = _jpeg_exif_orientation(embedded) if embedded else 0
+            bundle["orientation"] = orient if orient else _orientation_from_candidates(cands)
+
         if light:
-            bundle["orientation"] = (_jpeg_exif_orientation(embedded) if embedded else 0) or 1
             _RAW_BUNDLE_CACHE[file_path] = bundle
             _RAW_BUNDLE_CACHE.move_to_end(file_path)
             while len(_RAW_BUNDLE_CACHE) > _RAW_BUNDLE_MAX:
                 _RAW_BUNDLE_CACHE.popitem(last=False)
             return bundle
-
-        cands = list(_iter_raw_tiff_candidates(data))
-        orient = _jpeg_exif_orientation(embedded) if embedded else 0
-        bundle["orientation"] = orient if orient else _orientation_from_candidates(cands)
 
         res = _default_exif_res()
         # CR3 优先走 CMT 权威块（顺序固定、偏移基准正确）；扫不到/字段缺再回落签名扫描补齐
@@ -386,9 +473,10 @@ def _jpeg_exif_orientation(data: bytes) -> int:
     return 0
 
 def raw_embedded_orientation(file_path: str, embedded: bytes = None, light: bool = False) -> int:
-    """RAW 方向唯一来源：优先内嵌预览 JPEG 自己的 EXIF 方向（和显示像素同源），兜底容器枚举（走单趟缓存）"""
+    """RAW 方向唯一来源：ARW / CR2 等原生 TIFF 架构生肉强制以容器 IFD0 为准；CR3 优先内嵌预览自身 EXIF"""
     try:
-        if embedded:
+        is_tiff_raw = file_path.lower().endswith(('.arw', '.cr2', '.nef', '.dng'))
+        if embedded and not is_tiff_raw:
             val = _jpeg_exif_orientation(embedded)
             if val:
                 return val
@@ -964,9 +1052,9 @@ def parse_photo_exif(file_path: str) -> dict:
 
 def parse_photo_rating(file_path: str) -> int:
     """
-    读取照片 XMP 机内打星 (xmp:Rating 0~5)，只读不写。
-    兼容: JPEG (APP1 XMP 段) / 佳能 CR3·CR2 及索尼·尼康 RAW (容器内嵌 XMP 包)。
-    未打星或解析失败一律返回 0。对标 DPP 星级，零依赖二进制直读。
+    读取照片机内打星 (xmp:Rating 0~5 / Sony MakerNote 0x2002)，只读不写。
+    兼容: JPEG / 佳能 CR3·CR2 / 索尼 ARW / 尼康 NEF 及同名 .xmp 伴侣文件。
+    未打星或解析失败一律返回 0。
     """
     def _rating_from(buf: bytes) -> int:
         m = re.search(rb'xmp:Rating\s*=\s*"\s*(-?\d)\s*"', buf)
@@ -981,35 +1069,65 @@ def parse_photo_rating(file_path: str) -> int:
 
     p = Path(file_path)
     try:
+        # 1. 优先嗅探同名 .xmp 伴侣文件 (Lightroom / Bridge / 达芬奇)
+        for sidecar in (p.with_suffix('.xmp'), p.with_suffix('.XMP'), p.parent / (p.name + '.xmp')):
+            if sidecar.exists():
+                try:
+                    s_val = _rating_from(sidecar.read_bytes())
+                    if s_val > 0:
+                        return s_val
+                except Exception:
+                    pass
+
         ext = p.suffix.lower()
-        with open(p, 'rb') as f:
-            if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
-                head = f.read(262144)  # JPEG 的 XMP 常驻文件头 256KB 内
-                idx = head.find(b'<x:xmpmeta')
-                if idx >= 0:
-                    return _rating_from(head[idx: idx + 65536])
-                return _rating_from(head)
-            elif ext in (".cr3", ".cr2", ".arw", ".nef", ".dng"):
-                # RAW 容器内嵌 XMP 包：缓存命中直接取（缩略图/单张查看路径零额外读盘）；
-                # 未命中时分块轻扫 XMP，避免纯打星场景整读 96MB 触发完整 bundle
-                ent = _RAW_BUNDLE_CACHE.get(file_path)
-                if ent is not None:
-                    try:
-                        return int(ent.get("rating", 0))
-                    except Exception:
-                        return 0
-                with open(p, 'rb') as f:
-                    prev_tail = b""
-                    for _ in range(6):  # 最多扫 96MB，找到 XMP 即停
-                        chunk = f.read(16 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        buf = prev_tail + chunk
-                        idx = buf.find(b'<x:xmpmeta')
-                        if idx >= 0:
-                            return _rating_from(buf[idx: idx + 65536])
-                        prev_tail = buf[-64:]
-                return 0
+        if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+            with open(p, 'rb') as f:
+                head = f.read(262144)
+            idx = head.find(b'<x:xmpmeta')
+            if idx >= 0:
+                return _rating_from(head[idx: idx + 65536])
+            return _rating_from(head)
+
+        elif ext in (".cr3", ".cr2", ".arw", ".nef", ".dng"):
+            ent = _RAW_BUNDLE_CACHE.get(file_path)
+            if ent is not None:
+                try:
+                    return int(ent.get("rating", 0))
+                except Exception:
+                    return 0
+
+            with open(p, 'rb') as f:
+                head_chunk = f.read(4 * 1024 * 1024)
+
+            # 内嵌 XMP 扫描
+            idx = head_chunk.find(b'<x:xmpmeta')
+            if idx >= 0:
+                r = _rating_from(head_chunk[idx: idx + 65536])
+                if r > 0:
+                    return r
+
+            # 索尼 ARW 专属：MakerNote 0x2002 硬件机内打星
+            if ext == '.arw':
+                pos = 0
+                while True:
+                    idx_sony = head_chunk.find(b'SONY DSC', pos)
+                    if idx_sony == -1:
+                        break
+                    if idx_sony + 14 <= len(head_chunk):
+                        cnt = struct.unpack_from('<H', head_chunk, idx_sony + 12)[0]
+                        if 0 < cnt <= 512:
+                            for i in range(cnt):
+                                ep = idx_sony + 14 + i * 12
+                                if ep + 12 > len(head_chunk):
+                                    break
+                                tag = struct.unpack_from('<H', head_chunk, ep)[0]
+                                if tag == 0x2002:
+                                    r_val = struct.unpack_from('<I', head_chunk, ep + 8)[0]
+                                    if 1 <= r_val <= 5:
+                                        return r_val
+                    pos = idx_sony + 8
+
+            return 0
     except Exception:
         return 0
     return 0
@@ -4195,14 +4313,17 @@ class AlbumPageWidget(QWidget):
     def _on_viewer_rating_requested(self, file_path: str, rating: int):
         """DPP 式打星: 写入 -> 回读校验 -> 三处联动(标题栏/卡片徽标/排序过滤)"""
         ok, msg = write_photo_rating(file_path, rating)
-        if ok and parse_photo_rating(file_path) == rating:
-            self.ratings[file_path] = rating
-            self.photo_viewer.update_rating_label(rating)
-            self._rebuild_photo_list()
-            self.gallery.viewport().update()
-        else:
-            detail = msg if not ok else "写入后回读校验不一致，文件可能受写保护"
-            QMessageBox.warning(self, "打星写入失败", f"{Path(file_path).name}\n\n{detail}")
+        if ok:
+            # 穿透内存单趟缓存，确保回读直达物理磁盘
+            _RAW_BUNDLE_CACHE.pop(file_path, None)
+            if parse_photo_rating(file_path) == rating:
+                self.ratings[file_path] = rating
+                self.photo_viewer.update_rating_label(rating)
+                self._rebuild_photo_list()
+                self.gallery.viewport().update()
+                return
+        detail = msg if not ok else "写入后回读校验不一致，文件可能受写保护"
+        QMessageBox.warning(self, "打星写入失败", f"{Path(file_path).name}\n\n{detail}")
 
     def _on_viewer_toggle_select(self, file_path: str):
         delegate = self.gallery.delegate
@@ -4961,13 +5082,15 @@ class DarkroomPageWidget(QWidget):
 
     def _on_viewer_rating_requested(self, file_path: str, rating: int):
         ok, msg = write_photo_rating(file_path, rating)
-        if ok and parse_photo_rating(file_path) == rating:
-            self.gallery.delegate.ratings[file_path] = rating
-            self.photo_viewer.update_rating_label(rating)
-            self.gallery.viewport().update()
-        else:
-            detail = msg if not ok else "写入后回读校验不一致，文件可能受写保护"
-            QMessageBox.warning(self, "打星写入失败", f"{Path(file_path).name}\n\n{detail}")
+        if ok:
+            _RAW_BUNDLE_CACHE.pop(file_path, None)
+            if parse_photo_rating(file_path) == rating:
+                self.gallery.delegate.ratings[file_path] = rating
+                self.photo_viewer.update_rating_label(rating)
+                self.gallery.viewport().update()
+                return
+        detail = msg if not ok else "写入后回读校验不一致，文件可能受写保护"
+        QMessageBox.warning(self, "打星写入失败", f"{Path(file_path).name}\n\n{detail}")
 
     def _on_viewer_toggle_hide(self, file_path: str):
         delegate = self.gallery.delegate
