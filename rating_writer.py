@@ -9,6 +9,7 @@ XMP 打星写入引擎 (xmp:Rating 0~5)
 """
 import os
 import re
+import struct
 from pathlib import Path
 
 XMP_PACKET_HEADER = b'http://ns.adobe.com/xap/1.0/\x00'
@@ -156,6 +157,66 @@ def _write_cr3(path: Path, rating: int) -> tuple[bool, str]:
     box = (8 + 16 + len(packet)).to_bytes(4, 'big') + b'uuid' + XMP_UUID + packet
     return _atomic_write(path, data + box)
 
+def _write_arw(path: Path, rating: int) -> tuple[bool, str]:
+    """
+    索尼 ARW 原地安全原子改写引擎:
+    1. 优先原地覆写 Sony MakerNote Tag 0x2002 (4字节内联 uint32，机身/LR双互认)
+    2. 若内嵌 XMP 包，执行 1:1 绝对等长单字符改写，保持 TIFF 偏移链表绝对守恒
+    3. 全程文件总字节数 1 字节不增不减，绝对不触碰 RAW 像素
+    """
+    data = bytearray(path.read_bytes())
+    if len(data) < 16 or data[:4] not in (b'II*\x00', b'MM\x00*'):
+        return False, "不是有效的 ARW/TIFF 容器结构"
+
+    modified = False
+    scan_limit = min(len(data), 4 * 1024 * 1024)
+
+    # 1. 扫描 Sony MakerNote Tag 0x2002 原地覆写
+    pos = 0
+    while True:
+        idx = data.find(b'SONY DSC', pos, scan_limit)
+        if idx == -1:
+            break
+        if idx + 14 <= len(data):
+            cnt = struct.unpack_from('<H', data, idx + 12)[0]
+            if 0 < cnt <= 512:
+                for i in range(cnt):
+                    p = idx + 14 + i * 12
+                    if p + 12 > len(data):
+                        break
+                    tag = struct.unpack_from('<H', data, p)[0]
+                    if tag == 0x2002:
+                        data[p + 8 : p + 12] = struct.pack('<I', rating)
+                        modified = True
+                        break
+                if modified:
+                    break
+        pos = idx + 8
+
+    # 2. 若 ARW 内部带有内嵌 XMP，同步执行 1:1 绝对等长字符替换
+    xmp_idx = data.find(b'<x:xmpmeta', 0, scan_limit)
+    if xmp_idx >= 0:
+        xmp_end = data.find(b'</x:xmpmeta>', xmp_idx, xmp_idx + 131072)
+        if xmp_end > 0:
+            xmp_chunk = bytes(data[xmp_idx : xmp_end + 12])
+            rating_b = str(rating).encode('ascii')
+            m_attr = re.search(rb'(xmp:Rating\s*=\s*")(\d)(")', xmp_chunk)
+            if m_attr:
+                offset = xmp_idx + m_attr.start(2)
+                data[offset : offset + 1] = rating_b
+                modified = True
+            else:
+                m_elem = re.search(rb'(<xmp:Rating>)(\d)(</xmp:Rating>)', xmp_chunk)
+                if m_elem:
+                    offset = xmp_idx + m_elem.start(2)
+                    data[offset : offset + 1] = rating_b
+                    modified = True
+
+    if not modified:
+        return False, "ARW 结构中未检索到可原地安全改写的打星段 (0x2002/XMP)"
+
+    return _atomic_write(path, bytes(data))
+
 
 def write_photo_rating(file_path: str, rating: int) -> tuple[bool, str]:
     """
@@ -179,7 +240,9 @@ def write_photo_rating(file_path: str, rating: int) -> tuple[bool, str]:
             return _write_jpg(p, rating)
         if ext in ('.cr3', '.cr2'):
             return _write_cr3(p, rating)
-        return False, f"暂不支持向 {ext or '该格式'} 写入打星 (当前支持 JPG / CR3 / CR2)"
+        if ext in ('.arw',):
+            return _write_arw(p, rating)
+        return False, f"暂不支持向 {ext or '该格式'} 写入打星 (当前支持 JPG / CR3 / CR2 / ARW)"
     except PermissionError:
         return False, "文件被占用或没有写入权限"
     except Exception as e:
