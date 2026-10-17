@@ -1,6 +1,8 @@
 from sony_af import extract_sony_af_points, _sony_af_core, _sony_af_from_jpeg_bytes
+from nikon_af import _nikon_af_core
 import os
 import sys
+import math
 import struct
 import hashlib
 import re
@@ -25,7 +27,7 @@ from sony_af import extract_sony_af_points, _sony_af_core, _sony_af_from_jpeg_by
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush, QPixmap, 
     QImage, QImageReader, QFontMetrics, QKeyEvent, QMouseEvent, 
-    QWheelEvent, QCursor, QTransform, QAction
+    QWheelEvent, QCursor, QTransform, QAction, QPainterPath
 )
 
 VALID_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -45,7 +47,10 @@ DEFAULT_SHORTCUTS = {
     "eye_zoom":       ("R", "眼部特写 开/关", "鼠标双击"),
     "af":             ("F", "对焦点显示 开/关", ""),
     "compare":        ("C", "对比模式 开/关", ""),
+    "grid":           ("Q", "构图辅助线 循环切换", "Shift+Q 翻转螺旋象限"),
+    "precrop":        ("W", "预裁剪遮罩 循环切换", ""),
 }
+
 
 # 系统保留快捷键（与体系深度绑定，仅展示不可修改）
 FIXED_SHORTCUTS = [
@@ -410,14 +415,20 @@ def _raw_bundle(file_path: str, light: bool = False) -> dict:
                 vendor = _makernote_vendor(etiff)
                 if vendor == b'SONY':
                     boxes = _sony_af_core(etiff, '<' if etiff[:2] == b'II' else '>', o)
+                elif vendor == b'NIKON':
+                    boxes = _nikon_af_core(etiff, '<' if etiff[:2] == b'II' else '>', o)
                 else:
                     boxes = _canon_af_core(etiff, '<' if etiff[:2] == b'II' else '>', o)
 
-        # 路径 2: 内嵌预览无 MakerNote 时，直接解剖 RAW 容器自身 (索尼 ARW 主干即是 TIFF / 佳能 CR3 独立块)
+        # 路径 2: 内嵌预览无 MakerNote 时，直接解剖 RAW 容器自身 (索尼 ARW / 尼康 NEF / 佳能 CR3)
         if not boxes:
             for tiff, endian in cands:
-                # 尝试索尼 ARW 容器本身 (读取 IFD0 -> ExifIFD -> SONY MakerNote 0x2027)
+                # 尝试索尼 ARW 容器本身
                 boxes = _sony_af_core(tiff, endian, o)
+                if boxes:
+                    break
+                # 尝试尼康 NEF 容器本身 (Tag 0x00B7 AFInfo2)
+                boxes = _nikon_af_core(tiff, endian, o)
                 if boxes:
                     break
                 # 尝试佳能原生/独立块
@@ -1322,6 +1333,8 @@ def _makernote_vendor(tiff_data: bytes) -> bytes | None:
             head = tiff_data[mn_off:mn_off + 12]
             if head.startswith(b'SONY'):
                 return b'SONY'
+            if head.startswith(b'Nikon'):
+                return b'NIKON'
     except Exception:
         pass
     return None
@@ -1333,8 +1346,13 @@ def _af_from_jpeg_bytes(data: bytes, orientation: int = 1) -> list:
         tiff_data = _exif_tiff_block(data)
         if tiff_data is None:
             return []
-        if _makernote_vendor(tiff_data) == b'SONY':
+        vendor = _makernote_vendor(tiff_data)
+        if vendor == b'SONY':
             boxes = _sony_af_core(tiff_data, '<', orientation)
+            if boxes:
+                return boxes
+        elif vendor == b'NIKON':
+            boxes = _nikon_af_core(tiff_data, '<', orientation)
             if boxes:
                 return boxes
         return _canon_af_core(tiff_data, '<' if tiff_data[:2] == b'II' else '>', orientation) or []
@@ -2081,9 +2099,9 @@ class MinimapNavigator(QWidget):
         if self.is_dragging:
             self._handle_mouse_move(event.pos())
 
-    def mouseReleaseEvent(self, event: QMouseEvent):
+    '''def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
-            self.is_dragging = False
+            self.is_dragging = False'''
 
     def _handle_mouse_move(self, pos: QPoint):
         inner_rect = self.rect().adjusted(4, 4, -4, -4)
@@ -2335,6 +2353,62 @@ class SinglePhotoViewer(QWidget):
         self.btn_compare.setToolTip(f"对比模式 ({load_shortcuts()['compare']})")
         self.btn_compare.clicked.connect(self._toggle_compare)
 
+        self.grid_mode = 0  # 0:关, 1:三分线, 2:黄金分割, 3:黄金螺旋, 4:对角三角, 5:中心十字
+        self.spiral_orientation = 0  # 0:右上, 1:右下, 2:左下, 3:左上 (Shift+Q 翻转)
+        self._GRID_NAMES = ["📐 构图", "📐 三分", "📐 黄金比", "📐 螺旋", "📐 九宫交叉", "📐 十字"]
+        self.btn_grid_toggle = QPushButton("📐 构图")
+        self.btn_grid_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid transparent; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #d4d4d8; } QPushButton:hover { background-color: #27272e; color: #38bdf8; }")
+        self.btn_grid_toggle.setToolTip(f"诺基亚构图辅助线 ({load_shortcuts().get('grid', 'Q')})")
+        self.btn_grid_toggle.clicked.connect(self._cycle_grid_mode)
+
+        self.crop_active = False
+        self.crop_ratio_mode = "4:5"  # "free", "4:5", "3:4", "1:1", "9:16", "16:9", "custom"
+        self.crop_target_aspect = 4.0 / 5.0
+        self.norm_crop_rect = QRectF(0.1, 0.05, 0.8, 0.9)  # 相对于原图的归一化裁切矩形 (0.0~1.0)
+        self.crop_drag_mode = None  # 'move', 'top', 'bottom', 'left', 'right', 'tl', 'tr', 'bl', 'br'
+        self.crop_drag_start_pos = QPointF()
+        self.crop_drag_start_norm_rect = QRectF()
+
+        self.btn_crop_toggle = QPushButton("🔲 裁切")
+        self.btn_crop_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid transparent; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #d4d4d8; } QPushButton:hover { background-color: #27272e; color: #38bdf8; }")
+        self.btn_crop_toggle.setToolTip(f"预裁剪交互模式 ({load_shortcuts().get('precrop', 'W')})")
+        self.btn_crop_toggle.clicked.connect(self._toggle_crop_active)
+
+        self.combo_crop_ratio = QComboBox()
+        self.combo_crop_ratio.setVisible(False)
+        self.combo_crop_ratio.setFixedHeight(22)
+        self.combo_crop_ratio.setStyleSheet("""
+            QComboBox {
+                background-color: #141418;
+                border: 1px solid #0284c7;
+                border-radius: 2px;
+                padding: 1px 4px;
+                color: #38bdf8;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #18181c;
+                border: 1px solid #3f3f46;
+                selection-background-color: #0284c7;
+                color: #f4f4f5;
+            }
+        """)
+        self.combo_crop_ratio.addItem("4:5 (小红书)", "4:5")
+        self.combo_crop_ratio.addItem("3:4 (人像)", "3:4")
+        self.combo_crop_ratio.addItem("1:1 (正方形)", "1:1")
+        self.combo_crop_ratio.addItem("9:16 (壁纸)", "9:16")
+        self.combo_crop_ratio.addItem("16:9 (横屏)", "16:9")
+        self.combo_crop_ratio.addItem("自由比例", "free")
+        self.combo_crop_ratio.addItem("自定义比例...", "custom")
+        self.combo_crop_ratio.currentIndexChanged.connect(self._on_crop_ratio_changed)
+        self.combo_crop_ratio.setFocusPolicy(Qt.NoFocus)
+
+        self.lbl_crop_live_ratio = QLabel("4:5")
+        self.lbl_crop_live_ratio.setVisible(False)
+        self.lbl_crop_live_ratio.setAlignment(Qt.AlignCenter)
+        self.lbl_crop_live_ratio.setStyleSheet("QLabel { background-color: #142231; color: #38bdf8; border: 1px solid #0369a1; border-radius: 2px; font-size: 11px; font-weight: bold; padding: 2px 8px; min-height: 20px; max-height: 20px; font-family: Consolas, monospace; }")
+
         # 6. 左下角精炼浮动工具条
         self.tool_box = QFrame(self)
         self.tool_box.setStyleSheet("QFrame { background-color: rgba(18, 18, 22, 230); border: 1px solid #2e2e36; border-radius: 4px; padding: 2px 4px; }")
@@ -2372,9 +2446,9 @@ class SinglePhotoViewer(QWidget):
 
         # 【全键盘驾驶舱防线】彻底剥夺所有悬浮/工具按钮的键盘焦点，杜绝方向键被抢！
         for b in (self.btn_back, self.btn_eye_zoom, self.btn_af_toggle, self.btn_compare,
-                  self.btn_cinema_fullscreen, self.btn_filmstrip_toggle, self.btn_mark_toggle,
-                  self.btn_prev, self.btn_next, self.btn_cmp_left_next, self.btn_cmp_right_prev,
-                  self.btn_zoom_menu):
+                  self.btn_grid_toggle, self.btn_crop_toggle, self.btn_cinema_fullscreen, self.btn_filmstrip_toggle,
+                  self.btn_mark_toggle, self.btn_prev, self.btn_next, self.btn_cmp_left_next,
+                  self.btn_cmp_right_prev, self.btn_zoom_menu):
             b.setFocusPolicy(Qt.NoFocus)
         self.slider_zoom.setFocusPolicy(Qt.NoFocus)
         self.edit_zoom.setFocusPolicy(Qt.ClickFocus)
@@ -2428,10 +2502,16 @@ class SinglePhotoViewer(QWidget):
         self.btn_cmp_left_next.setVisible(False)
         self.btn_cmp_right_prev.setVisible(False)
         # 快捷键改绑后，进入检视器时按钮文案即时刷新
+        sc = load_shortcuts()
         if not self.is_eye_zoom_mode:
             self.btn_eye_zoom.setText("👁️ 特写")
+        self.btn_eye_zoom.setToolTip(f"眼部特写 ({sc.get('eye_zoom', 'R')})")
         self.btn_af_toggle.setText("🎯 对焦")
+        self.btn_af_toggle.setToolTip(f"对焦点显示 ({sc.get('af', 'F')})")
         self.btn_compare.setText("🆚 对比")
+        self.btn_compare.setToolTip(f"对比模式 ({sc.get('compare', 'C')})")
+        self.btn_grid_toggle.setToolTip(f"构图辅助线 ({sc.get('grid', 'Q')})")
+        self.btn_crop_toggle.setToolTip(f"预裁剪交互模式 ({sc.get('precrop', 'W')})")
 
         self.filmstrip_model.set_photos(self.photo_list)
         delegate = FilmstripDelegate(self.filmstrip_view, thumb_cache=thumb_cache)
@@ -3087,6 +3167,15 @@ class SinglePhotoViewer(QWidget):
 
         painter.drawPixmap(QRectF(draw_x, draw_y, draw_w, draw_h).toRect(), self.current_pixmap)
 
+        # 诺基亚构图辅助线 (若开启裁切模式，自动隐藏全局线，避免打架)
+        if self.grid_mode > 0 and not self.crop_active:
+            painter.device().spiral_orientation = getattr(self, "spiral_orientation", 0)
+            self._draw_lumia_grid(painter, QRectF(draw_x, draw_y, draw_w, draw_h), self.grid_mode)
+
+        # 2. 交互式预裁剪 50% 阴影遮罩渲染
+        if self.crop_active:
+            self._draw_interactive_crop(painter, QRectF(draw_x, draw_y, draw_w, draw_h))
+
         if self.show_af_points and self.current_af_boxes:
             painter.setRenderHint(QPainter.Antialiasing)
             for box_data in self.current_af_boxes:
@@ -3149,6 +3238,12 @@ class SinglePhotoViewer(QWidget):
 
                 painter.save()
                 painter.setClipRect(pr)
+                if self.grid_mode > 0:
+                    painter.device().spiral_orientation = getattr(self, "spiral_orientation", 0)
+                    self._draw_lumia_grid(painter, QRectF(draw_x, draw_y, draw_w, draw_h), self.grid_mode)
+
+                if self.crop_mode > 0 and self._CROP_RATIOS[self.crop_mode]:
+                    self._draw_precrop_mask(painter, QRectF(draw_x, draw_y, draw_w, draw_h), self._CROP_RATIOS[self.crop_mode])
                 painter.drawPixmap(QRectF(draw_x, draw_y, draw_w, draw_h).toRect(), pm)
 
                 af_boxes = self.current_af_boxes if pane == 0 else self.compare_af_boxes
@@ -3357,6 +3452,24 @@ class SinglePhotoViewer(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
+            # 优先判定预裁剪取景框手柄拖拽
+            if self.crop_active and not self.compare_mode:
+                base_sz = self._get_base_scaled_size()
+                draw_w = base_sz.width() * self.zoom_factor
+                draw_h = base_sz.height() * self.zoom_factor
+                draw_x = (self.width() - draw_w) / 2.0 + self.pan_offset.x()
+                draw_y = (self.height() - draw_h) / 2.0 + self.pan_offset.y()
+                draw_rect = QRectF(draw_x, draw_y, draw_w, draw_h)
+                crop_rect = self._get_current_crop_pixel_rect(draw_rect)
+
+                mode = self._hit_test_crop_handle(event.position(), crop_rect)
+                if mode is not None:
+                    self.crop_drag_mode = mode
+                    self.crop_drag_start_pos = event.position()
+                    self.crop_drag_start_norm_rect = QRectF(self.norm_crop_rect)
+                    event.accept()
+                    return
+
             if self.compare_mode:
                 new_pane = 1 if self._pane_rect(1).contains(event.position()) else 0
                 if new_pane != self.active_pane:
@@ -3370,6 +3483,166 @@ class SinglePhotoViewer(QWidget):
             self.last_mouse_pos = event.pos()
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        # 1. 正在拖动或拉伸裁切框
+        if self.crop_active and self.crop_drag_mode and not self.compare_mode:
+            base_sz = self._get_base_scaled_size()
+            draw_w = base_sz.width() * self.zoom_factor
+            draw_h = base_sz.height() * self.zoom_factor
+            if draw_w > 0 and draw_h > 0:
+                delta = event.position() - self.crop_drag_start_pos
+                mode = self.crop_drag_mode
+                r0 = self.crop_drag_start_norm_rect
+
+                # 转换为屏幕物理像素进行绝对几何缩放与比例死锁
+                p0_x = r0.x() * draw_w
+                p0_y = r0.y() * draw_h
+                p0_w = r0.width() * draw_w
+                p0_h = r0.height() * draw_h
+
+                if mode == 'move':
+                    dx_norm = delta.x() / draw_w
+                    dy_norm = delta.y() / draw_h
+                    nx = max(0.0, min(1.0 - r0.width(), r0.x() + dx_norm))
+                    ny = max(0.0, min(1.0 - r0.height(), r0.y() + dy_norm))
+                    self.norm_crop_rect = QRectF(nx, ny, r0.width(), r0.height())
+                else:
+                    target_r = self.crop_target_aspect
+
+                    # ==================== 分支 A: 自由比例 (解除任何长宽比约束) ====================
+                    if target_r is None:
+                        new_px, new_py, new_pw, new_ph = p0_x, p0_y, p0_w, p0_h
+                        if 'left' in mode or mode in ('tl', 'bl'):
+                            new_pw = max(40.0, p0_w - delta.x())
+                            new_px = (p0_x + p0_w) - new_pw
+                        elif 'right' in mode or mode in ('tr', 'br'):
+                            new_pw = max(40.0, min(draw_w - p0_x, p0_w + delta.x()))
+
+                        if 'top' in mode or mode in ('tl', 'tr'):
+                            new_ph = max(40.0, p0_h - delta.y())
+                            new_py = (p0_y + p0_h) - new_ph
+                        elif 'bottom' in mode or mode in ('bl', 'br'):
+                            new_ph = max(40.0, min(draw_h - p0_y, p0_h + delta.y()))
+
+                    # ==================== 分支 B: 严格锁定比例 (对角锚点死锁算法) ====================
+                    else:
+                        if mode == 'br':
+                            # 固定左上角
+                            max_w = draw_w - p0_x
+                            max_h = draw_h - p0_y
+                            cand_w = max(40.0, p0_w + delta.x())
+                            cand_h = cand_w / target_r
+                            if cand_h > max_h or cand_w > max_w:
+                                cand_w = min(max_w, max_h * target_r)
+                                cand_h = cand_w / target_r
+                            new_px, new_py, new_pw, new_ph = p0_x, p0_y, cand_w, cand_h
+
+                        elif mode == 'tl':
+                            # 固定右下角
+                            anchor_r = p0_x + p0_w
+                            anchor_b = p0_y + p0_h
+                            cand_w = max(40.0, p0_w - delta.x())
+                            cand_h = cand_w / target_r
+                            if cand_w > anchor_r or cand_h > anchor_b:
+                                cand_w = min(anchor_r, anchor_b * target_r)
+                                cand_h = cand_w / target_r
+                            new_px = anchor_r - cand_w
+                            new_py = anchor_b - cand_h
+                            new_pw, new_ph = cand_w, cand_h
+
+                        elif mode == 'tr':
+                            # 固定左下角
+                            anchor_b = p0_y + p0_h
+                            max_w = draw_w - p0_x
+                            cand_w = max(40.0, p0_w + delta.x())
+                            cand_h = cand_w / target_r
+                            if cand_w > max_w or cand_h > anchor_b:
+                                cand_w = min(max_w, anchor_b * target_r)
+                                cand_h = cand_w / target_r
+                            new_px = p0_x
+                            new_py = anchor_b - cand_h
+                            new_pw, new_ph = cand_w, cand_h
+
+                        elif mode == 'bl':
+                            # 固定右上角
+                            anchor_r = p0_x + p0_w
+                            max_h = draw_h - p0_y
+                            cand_w = max(40.0, p0_w - delta.x())
+                            cand_h = cand_w / target_r
+                            if cand_w > anchor_r or cand_h > max_h:
+                                cand_w = min(anchor_r, max_h * target_r)
+                                cand_h = cand_w / target_r
+                            new_px = anchor_r - cand_w
+                            new_py = p0_y
+                            new_pw, new_ph = cand_w, cand_h
+
+                        elif mode in ('left', 'right'):
+                            # 拉侧边: 水平缩放，垂直中心对称等比展开
+                            cand_w = max(40.0, p0_w + (delta.x() if mode == 'right' else -delta.x()))
+                            cand_h = cand_w / target_r
+                            mid_y = p0_y + p0_h / 2.0
+                            if cand_h > draw_h:
+                                cand_h = draw_h
+                                cand_w = cand_h * target_r
+                            new_py = max(0.0, min(draw_h - cand_h, mid_y - cand_h / 2.0))
+                            if mode == 'right':
+                                cand_w = min(draw_w - p0_x, cand_w)
+                                cand_h = cand_w / target_r
+                                new_px = p0_x
+                            else:
+                                anchor_r = p0_x + p0_w
+                                cand_w = min(anchor_r, cand_w)
+                                cand_h = cand_w / target_r
+                                new_px = anchor_r - cand_w
+                            new_pw, new_ph = cand_w, cand_h
+
+                        else:  # 'top', 'bottom'
+                            # 拉底顶边: 垂直缩放，水平中心对称等比展开
+                            cand_h = max(40.0, p0_h + (delta.y() if mode == 'bottom' else -delta.y()))
+                            cand_w = cand_h * target_r
+                            mid_x = p0_x + p0_w / 2.0
+                            if cand_w > draw_w:
+                                cand_w = draw_w
+                                cand_h = cand_w / target_r
+                            new_px = max(0.0, min(draw_w - cand_w, mid_x - cand_w / 2.0))
+                            if mode == 'bottom':
+                                cand_h = min(draw_h - p0_y, cand_h)
+                                cand_w = cand_h * target_r
+                                new_py = p0_y
+                            else:
+                                anchor_b = p0_y + p0_h
+                                cand_h = min(anchor_b, cand_h)
+                                cand_w = cand_h * target_r
+                                new_py = anchor_b - cand_h
+                            new_pw, new_ph = cand_w, cand_h
+
+                    # 换算回归一化坐标并死死限制在原图内
+                    nx = max(0.0, min(1.0 - (new_pw / draw_w), new_px / draw_w))
+                    ny = max(0.0, min(1.0 - (new_ph / draw_h), new_py / draw_h))
+                    nw = min(1.0 - nx, new_pw / draw_w)
+                    nh = min(1.0 - ny, new_ph / draw_h)
+                    self.norm_crop_rect = QRectF(nx, ny, nw, nh)
+
+                self._sync_crop_ui_display()
+                self.update()
+                event.accept()
+                return
+
+        # 2. 鼠标悬停改变手势图标
+        if self.crop_active and not self.compare_mode and not self.is_dragging:
+            base_sz = self._get_base_scaled_size()
+            draw_w = base_sz.width() * self.zoom_factor
+            draw_h = base_sz.height() * self.zoom_factor
+            draw_x = (self.width() - draw_w) / 2.0 + self.pan_offset.x()
+            draw_y = (self.height() - draw_h) / 2.0 + self.pan_offset.y()
+            crop_rect = self._get_current_crop_pixel_rect(QRectF(draw_x, draw_y, draw_w, draw_h))
+            handle = self._hit_test_crop_handle(event.position(), crop_rect)
+            if handle in ('tl', 'br'): self.setCursor(Qt.SizeFDiagCursor)
+            elif handle in ('tr', 'bl'): self.setCursor(Qt.SizeBDiagCursor)
+            elif handle in ('left', 'right'): self.setCursor(Qt.SizeHorCursor)
+            elif handle in ('top', 'bottom'): self.setCursor(Qt.SizeVerCursor)
+            elif handle == 'move': self.setCursor(Qt.SizeAllCursor)
+            else: self.unsetCursor()
+
         if self.is_dragging:
             delta = event.pos() - self.last_mouse_pos
             self.last_mouse_pos = event.pos()
@@ -3378,6 +3651,7 @@ class SinglePhotoViewer(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
             self.is_dragging = False
+            self.crop_drag_mode = None
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         self._toggle_eye_zoom()
@@ -3391,6 +3665,8 @@ class SinglePhotoViewer(QWidget):
         k_eye = shortcut_qt_key(sc["eye_zoom"])
         k_af = shortcut_qt_key(sc["af"])
         k_cmp = shortcut_qt_key(sc["compare"])
+        k_grid = shortcut_qt_key(sc.get("grid", "Q"))
+        k_crop = shortcut_qt_key(sc.get("precrop", "W"))
 
         k_cmp_l_prev = shortcut_qt_key(sc.get("cmp_l_prev", "U"))
         k_cmp_l_next = shortcut_qt_key(sc.get("cmp_l_next", "I"))
@@ -3459,6 +3735,17 @@ class SinglePhotoViewer(QWidget):
         elif key == k_cmp:
             self._toggle_compare()
             event.accept()
+        elif key == k_grid:
+            if event.modifiers() & Qt.ShiftModifier:
+                # Shift + Q: 翻转黄金螺旋朝向象限 (对标 Lightroom Shift+O)
+                self.spiral_orientation = (self.spiral_orientation + 1) % 4
+                self.update()
+            else:
+                self._cycle_grid_mode()
+            event.accept()
+        elif key == k_crop:
+            self._toggle_crop_active()
+            event.accept()
         # 空格键：绑定沉浸全屏 开/关！
         elif key == Qt.Key_Space:
             self._toggle_fullscreen()
@@ -3519,6 +3806,428 @@ class SinglePhotoViewer(QWidget):
         else:
             self.btn_af_toggle.setStyleSheet(self._AF_BTN_INACTIVE)
         self.update()
+
+    def _cycle_grid_mode(self):
+        """循环切换诺基亚 Lumia 构图辅助线 (0:关 -> 1:三分 -> 2:黄金比 -> 3:螺旋 -> 4:三角 -> 5:十字)"""
+        self.grid_mode = (self.grid_mode + 1) % 6
+        self.btn_grid_toggle.setText(self._GRID_NAMES[self.grid_mode])
+        if self.grid_mode > 0:
+            self.btn_grid_toggle.setStyleSheet("QPushButton { background-color: #0c4a6e; border: 1px solid #0284c7; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #38bdf8; }")
+        else:
+            self.btn_grid_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid transparent; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #d4d4d8; } QPushButton:hover { background-color: #27272e; color: #38bdf8; }")
+        self.update()
+
+    @staticmethod
+    def _draw_lumia_grid(painter: QPainter, rect: QRectF, mode: int):
+        """相机原厂取景器纯黑构图辅助线绘制器 (与佳能/索尼/尼康机内 EVF 网格线完全一致)"""
+        if mode <= 0 or rect.width() <= 10 or rect.height() <= 10:
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setClipRect(rect)
+
+        x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+
+        def _draw_line(p1: QPointF, p2: QPointF):
+            # 相机原厂取景线：底层 1px 极淡反差白，表层纯黑锐利实线 (死守相机质感)
+            painter.setPen(QPen(QColor(255, 255, 255, 90), 2.0))
+            painter.drawLine(p1, p2)
+            painter.setPen(QPen(QColor(0, 0, 0, 235), 1.0))
+            painter.drawLine(p1, p2)
+
+        # 1. 经典三分线 (Rule of Thirds 3x3 + 纯黑十字准星)
+        if mode == 1:
+            x1, x2 = x + w / 3.0, x + w * 2.0 / 3.0
+            y1, y2 = y + h / 3.0, y + h * 2.0 / 3.0
+            _draw_line(QPointF(x1, y), QPointF(x1, y + h))
+            _draw_line(QPointF(x2, y), QPointF(x2, y + h))
+            _draw_line(QPointF(x, y1), QPointF(x + w, y1))
+            _draw_line(QPointF(x, y2), QPointF(x + w, y2))
+            
+            # 相机原厂纯黑交点十字准星
+            for ix in (x1, x2):
+                for iy in (y1, y2):
+                    painter.setPen(QPen(QColor(255, 255, 255, 100), 2.4))
+                    painter.drawLine(QPointF(ix - 5, iy), QPointF(ix + 5, iy))
+                    painter.drawLine(QPointF(ix, iy - 5), QPointF(ix, iy + 5))
+                    painter.setPen(QPen(QColor(0, 0, 0, 240), 1.2))
+                    painter.drawLine(QPointF(ix - 5, iy), QPointF(ix + 5, iy))
+                    painter.drawLine(QPointF(ix, iy - 5), QPointF(ix, iy + 5))
+
+        # 2. 黄金分割网格 (Phi Grid 1:0.618:1 纯黑)
+        elif mode == 2:
+            phi = 0.6180339887
+            x1, x2 = x + w * (1.0 - phi), x + w * phi
+            y1, y2 = y + h * (1.0 - phi), y + h * phi
+            _draw_line(QPointF(x1, y), QPointF(x1, y + h))
+            _draw_line(QPointF(x2, y), QPointF(x2, y + h))
+            _draw_line(QPointF(x, y1), QPointF(x + w, y1))
+            _draw_line(QPointF(x, y2), QPointF(x + w, y2))
+
+        # 3. 经典相机黄金螺旋 (真·斐波那契连续相切海螺线 + 引导方框 + 螺旋眼准星)
+        # 3. 黄金螺旋 (纯正对数螺线参数方程·一笔画连续采样，彻底杜绝任何杂线)
+        elif mode == 3:
+            rx, ry, rw, rh = rect.x(), rect.y(), rect.width(), rect.height()
+            phi = 0.6180339887
+            phi_inv = 1.6180339887
+
+            # 1. 拟合长宽比为 1.618 的黄金矩形
+            if rw >= rh:
+                if rw / rh > phi_inv:
+                    gh = rh
+                    gw = rh * phi_inv
+                else:
+                    gw = rw
+                    gh = rw / phi_inv
+            else:
+                if rh / rw > phi_inv:
+                    gw = rw
+                    gh = rw * phi_inv
+                else:
+                    gh = rh
+                    gw = rh / phi_inv
+
+            gx = rx + (rw - gw) / 2.0
+            gy = ry + (rh - gh) / 2.0
+
+            # 2. 读取翻转象限 (0:右上, 1:右下, 2:左下, 3:左上)
+            viewer = painter.device()
+            orient_idx = 0
+            for attr in ("spiral_orientation", "_spiral_orient"):
+                if hasattr(viewer, attr):
+                    orient_idx = getattr(viewer, attr)
+                    break
+
+            cx, cy = gx + gw / 2.0, gy + gh / 2.0
+            painter.save()
+            painter.setClipRect(rect)
+            painter.translate(cx, cy)
+            if orient_idx == 1:
+                painter.scale(1.0, -1.0)
+            elif orient_idx == 2:
+                painter.scale(-1.0, -1.0)
+            elif orient_idx == 3:
+                painter.scale(-1.0, 1.0)
+            painter.translate(-cx, -cy)
+
+            # 3. 计算黄金长方形内经典的 4 道分割正方形细虚线
+            # 极点 (螺旋眼) 理论收敛坐标
+            eye_x = gx + gw * (1.0 - 1.0 / (1.0 + phi ** 2))
+            eye_y = gy + gh * (1.0 - phi / (1.0 + phi ** 2))
+
+            # 绘制 4 阶正方形分割引导框 (干净极细线)
+            cur_l, cur_t, cur_w, cur_h = gx, gy, gw, gh
+            box_lines = []
+            for s in range(5):
+                if cur_w < 8 or cur_h < 8:
+                    break
+                if s % 4 == 0:
+                    cut = cur_h if cur_w >= cur_h else cur_w * phi
+                    box_lines.append((QPointF(cur_l + cut, cur_t), QPointF(cur_l + cut, cur_t + cur_h)))
+                    cur_l += cut
+                    cur_w -= cut
+                elif s % 4 == 1:
+                    cut = cur_w if cur_h >= cur_w else cur_h * phi
+                    box_lines.append((QPointF(cur_l, cur_t + cut), QPointF(cur_l + cur_w, cur_t + cut)))
+                    cur_t += cut
+                    cur_h -= cut
+                elif s % 4 == 2:
+                    cut = cur_h if cur_w >= cur_h else cur_w * phi
+                    box_lines.append((QPointF(cur_l + cur_w - cut, cur_t), QPointF(cur_l + cur_w - cut, cur_t + cur_h)))
+                    cur_w -= cut
+                elif s % 4 == 3:
+                    cut = cur_w if cur_h >= cur_w else cur_h * phi
+                    box_lines.append((QPointF(cur_l, cur_t + cur_h - cut), QPointF(cur_l + cur_w, cur_t + cur_h - cut)))
+                    cur_h -= cut
+
+            for p1, p2 in box_lines:
+                painter.setPen(QPen(QColor(255, 255, 255, 80), 1.6))
+                painter.drawLine(p1, p2)
+                painter.setPen(QPen(QColor(0, 0, 0, 180), 0.9, Qt.DashLine))
+                painter.drawLine(p1, p2)
+
+            # 4. 纯连续对数螺线参数方程绘制 (一笔画采样，100% 无折角无杂线)
+            # 极坐标: r = a * exp(b * theta)
+            b_coeff = math.log(phi_inv) / (math.pi / 2.0)  # 约 0.30635
+            max_r = math.sqrt((gx - eye_x) ** 2 + (gy + gh - eye_y) ** 2)
+            theta_max = 3.2 * math.pi
+            a_scale = max_r / math.exp(b_coeff * theta_max)
+
+            spiral_path = QPainterPath()
+            points_count = 180
+            for i in range(points_count + 1):
+                # 从最大外圈连续收缩至内圈焦点
+                t = theta_max * (1.0 - (i / float(points_count)))
+                r_val = a_scale * math.exp(b_coeff * t)
+                # 初始相位角对准左下起笔
+                theta_angle = t + math.pi * 0.75
+                pt_x = eye_x + r_val * math.cos(theta_angle)
+                pt_y = eye_y - r_val * math.sin(theta_angle)
+                if i == 0:
+                    spiral_path.moveTo(pt_x, pt_y)
+                else:
+                    spiral_path.lineTo(pt_x, pt_y)
+
+            # 双层相机质感渲染
+            painter.setPen(QPen(QColor(255, 255, 255, 110), 2.5))
+            painter.drawPath(spiral_path)
+            painter.setPen(QPen(QColor(0, 0, 0, 240), 1.2))
+            painter.drawPath(spiral_path)
+
+            # 5. 焦点 (螺旋眼) 极客准星
+            painter.setPen(QPen(QColor(56, 189, 248, 220), 1.2))
+            painter.drawLine(QPointF(eye_x - 6, eye_y), QPointF(eye_x + 6, eye_y))
+            painter.drawLine(QPointF(eye_x, eye_y - 6), QPointF(eye_x, eye_y + 6))
+            painter.drawEllipse(QPointF(eye_x, eye_y), 3.0, 3.0)
+
+            painter.restore()
+
+        # 4. 相机经典原厂：九宫格 + 对角线 (3x3 Grid + Diagonals，佳能/索尼取景器最经典构图线)
+        elif mode == 4:
+            # 1. 四角大交叉对角线 (贯穿全图的 X 轴透视引导线)
+            _draw_line(QPointF(x, y), QPointF(x + w, y + h))
+            _draw_line(QPointF(x + w, y), QPointF(x, y + h))
+
+            # 2. 标准 3x3 九宫格三分线 (两横两竖卡死黄金点)
+            x1, x2 = x + w / 3.0, x + w * 2.0 / 3.0
+            y1, y2 = y + h / 3.0, y + h * 2.0 / 3.0
+            _draw_line(QPointF(x1, y), QPointF(x1, y + h))
+            _draw_line(QPointF(x2, y), QPointF(x2, y + h))
+            _draw_line(QPointF(x, y1), QPointF(x + w, y1))
+            _draw_line(QPointF(x, y2), QPointF(x + w, y2))
+
+        # 5. 中心十字准星 (绝对中心纯黑靶心)
+        elif mode == 5:
+            cx, cy = x + w / 2.0, y + h / 2.0
+            _draw_line(QPointF(cx, y), QPointF(cx, y + h))
+            _draw_line(QPointF(x, cy), QPointF(x + w, cy))
+            r_circle = min(w, h) * 0.10
+            painter.setPen(QPen(QColor(255, 255, 255, 100), 2.2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPointF(cx, cy), r_circle, r_circle)
+            painter.setPen(QPen(QColor(0, 0, 0, 235), 1.2))
+            painter.drawEllipse(QPointF(cx, cy), r_circle, r_circle)
+
+        painter.restore() 
+
+    def _get_live_crop_aspect_text(self) -> str:
+        """
+        获取当前裁切框纯整数最简约分比例文本 (图内铭牌与右上角无延迟同步双显)
+        基于连分数 Farey 序列最佳有理数逼近:
+        - 自动过滤 1 像素物理抖动
+        - 瞬间收敛为纯整数最简约分比 (如 4:3, 16:9, 7:5, 5:4, 1:1)
+        - 彻底消灭任何浮点小数点！
+        """
+        from fractions import Fraction
+
+        base_sz = self._get_base_scaled_size()
+        draw_w = base_sz.width() * self.zoom_factor
+        draw_h = base_sz.height() * self.zoom_factor
+        if draw_w <= 0 or draw_h <= 0 or self.norm_crop_rect.height() <= 0:
+            return self.crop_ratio_mode.upper()
+
+        pw = self.norm_crop_rect.width() * draw_w
+        ph = self.norm_crop_rect.height() * draw_h
+        if pw <= 0 or ph <= 0:
+            return "1:1"
+
+        # 1. 固定锁定比例模式：直接展示锁定标准比例 (如 4:5, 3:4, 16:9 等)
+        if self.crop_target_aspect is not None and self.crop_ratio_mode != "free":
+            if self.crop_ratio_mode in ("4:5", "3:4", "1:1", "9:16", "16:9"):
+                return self.crop_ratio_mode
+            # 自定义输入的数值 (如 2.35 或 21:9)，连分数自动求最简整数比
+            frac_fixed = Fraction(self.crop_target_aspect).limit_denominator(32)
+            return f"{frac_fixed.numerator}:{frac_fixed.denominator}"
+
+        # 2. 自由拉伸模式：连分数有理数智能约分，抗抖动自动归纳最简整数比
+        current_val = pw / ph
+        frac_live = Fraction(current_val).limit_denominator(28)
+        num, den = frac_live.numerator, frac_live.denominator
+
+        return f"自由 {num}:{den}"
+
+    def _sync_crop_ui_display(self):
+        """同步刷新右上角实时比例徽标"""
+        if self.crop_active:
+            live_txt = self._get_live_crop_aspect_text()
+            self.lbl_crop_live_ratio.setText(live_txt)
+            self.lbl_crop_live_ratio.setVisible(True)
+        else:
+            self.lbl_crop_live_ratio.setVisible(False)
+
+    def _toggle_crop_active(self):
+        """开启或退出预裁剪工作台模式"""
+        self.crop_active = not self.crop_active
+        self.combo_crop_ratio.setVisible(self.crop_active)
+        self.lbl_crop_live_ratio.setVisible(self.crop_active)
+        if self.crop_active:
+            self.btn_crop_toggle.setStyleSheet("QPushButton { background-color: #0c4a6e; border: 1px solid #0284c7; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #38bdf8; }")
+            self._apply_crop_aspect_constraint()
+        else:
+            self.btn_crop_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid transparent; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #d4d4d8; } QPushButton:hover { background-color: #27272e; color: #38bdf8; }")
+            self.unsetCursor()
+        self._sync_crop_ui_display()
+        self.update()
+
+    def _on_crop_ratio_changed(self):
+        mode = self.combo_crop_ratio.currentData()
+        if mode == "custom":
+            from PySide6.QtWidgets import QInputDialog
+            val, ok = QInputDialog.getText(self, "自定义裁切比例", "请输入目标宽高比 (例如 2.35:1 或 21:9):", text="2.35:1")
+            if ok and val.strip():
+                try:
+                    parts = val.replace("：", ":").split(":")
+                    if len(parts) == 2:
+                        w_val, h_val = float(parts[0]), float(parts[1])
+                        self.crop_target_aspect = w_val / max(0.01, h_val)
+                    else:
+                        self.crop_target_aspect = float(val)
+                    self.crop_ratio_mode = f"{val.strip()}"
+                except Exception:
+                    self.crop_target_aspect = None
+                    self.crop_ratio_mode = "free"
+            else:
+                self.combo_crop_ratio.blockSignals(True)
+                self.combo_crop_ratio.setCurrentIndex(0)
+                self.combo_crop_ratio.blockSignals(False)
+                mode = "4:5"
+                self.crop_ratio_mode = mode
+                self.crop_target_aspect = 4.0 / 5.0
+        else:
+            self.crop_ratio_mode = mode
+            aspect_map = {"4:5": 4.0/5.0, "3:4": 3.0/4.0, "1:1": 1.0, "9:16": 9.0/16.0, "16:9": 16.0/9.0, "free": None}
+            self.crop_target_aspect = aspect_map.get(mode, None)
+
+        self._apply_crop_aspect_constraint()
+        self._sync_crop_ui_display()
+        self.update()
+
+    def _apply_crop_aspect_constraint(self):
+        """按所选目标画幅重构裁切框初始位置 (保证框内完全在原图内)"""
+        if self.crop_target_aspect is None:
+            return  # 自由比例不强制锁定
+
+        base_sz = self._get_base_scaled_size()
+        if base_sz.width() <= 0 or base_sz.height() <= 0:
+            return
+
+        img_aspect = base_sz.width() / base_sz.height()
+        target_aspect = self.crop_target_aspect
+
+        # 在归一化坐标空间 (0.0~1.0) 内计算几何比例
+        if img_aspect > target_aspect:
+            nh = 0.88
+            nw = (nh * target_aspect) / img_aspect
+        else:
+            nw = 0.88
+            nh = (nw / target_aspect) * img_aspect
+
+        nw = max(0.05, min(1.0, nw))
+        nh = max(0.05, min(1.0, nh))
+        nx = (1.0 - nw) / 2.0
+        ny = (1.0 - nh) / 2.0
+        self.norm_crop_rect = QRectF(nx, ny, nw, nh)
+
+    def _get_current_crop_pixel_rect(self, draw_rect: QRectF) -> QRectF:
+        """将归一化裁切框换算为当前屏幕物理像素矩形"""
+        x = draw_rect.x() + self.norm_crop_rect.x() * draw_rect.width()
+        y = draw_rect.y() + self.norm_crop_rect.y() * draw_rect.height()
+        w = self.norm_crop_rect.width() * draw_rect.width()
+        h = self.norm_crop_rect.height() * draw_rect.height()
+        return QRectF(x, y, w, h)
+
+    def _hit_test_crop_handle(self, mouse_pos: QPointF, crop_rect: QRectF) -> str:
+        """测试光标落在裁切框的哪条边缘或手柄上 (8px 触控裕量)"""
+        margin = 9.0
+        x, y, w, h = crop_rect.x(), crop_rect.y(), crop_rect.width(), crop_rect.height()
+
+        on_l = abs(mouse_pos.x() - x) <= margin and (y - margin <= mouse_pos.y() <= y + h + margin)
+        on_r = abs(mouse_pos.x() - (x + w)) <= margin and (y - margin <= mouse_pos.y() <= y + h + margin)
+        on_t = abs(mouse_pos.y() - y) <= margin and (x - margin <= mouse_pos.x() <= x + w + margin)
+        on_b = abs(mouse_pos.y() - (y + h)) <= margin and (x - margin <= mouse_pos.x() <= x + w + margin)
+
+        if on_l and on_t: return 'tl'
+        if on_r and on_t: return 'tr'
+        if on_l and on_b: return 'bl'
+        if on_r and on_b: return 'br'
+        if on_l: return 'left'
+        if on_r: return 'right'
+        if on_t: return 'top'
+        if on_b: return 'bottom'
+        if crop_rect.contains(mouse_pos): return 'move'
+        return None
+
+    def _draw_interactive_crop(self, painter: QPainter, draw_rect: QRectF):
+        """专业级可交互预裁剪渲染器: 框外精准压暗 50%，框内 100% 原图 + 专属纯黑九宫格"""
+        if not self.crop_active or draw_rect.width() <= 10 or draw_rect.height() <= 10:
+            return
+
+        crop_rect = self._get_current_crop_pixel_rect(draw_rect)
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setClipRect(draw_rect)
+
+        # 1. 框外 50% 纯黑遮罩 (利用差集精准避开框内，框内 100% 原始透光)
+        mask_path = QPainterPath()
+        mask_path.addRect(draw_rect)
+        mask_path.addRect(crop_rect)
+        painter.setBrush(QColor(0, 0, 0, 128))
+        painter.setPen(Qt.NoPen)
+        painter.drawPath(mask_path)
+
+        # 2. 框内专属九宫格三分辅助线 (纯黑相机取景线 + 极细反差底)
+        cx, cy, cw, ch = crop_rect.x(), crop_rect.y(), crop_rect.width(), crop_rect.height()
+        x1, x2 = cx + cw / 3.0, cx + cw * 2.0 / 3.0
+        y1, y2 = cy + ch / 3.0, cy + ch * 2.0 / 3.0
+
+        def _draw_grid_line(p1, p2):
+            painter.setPen(QPen(QColor(255, 255, 255, 75), 1.8))
+            painter.drawLine(p1, p2)
+            painter.setPen(QPen(QColor(0, 0, 0, 200), 1.0))
+            painter.drawLine(p1, p2)
+
+        _draw_grid_line(QPointF(x1, cy), QPointF(x1, cy + ch))
+        _draw_grid_line(QPointF(x2, cy), QPointF(x2, cy + ch))
+        _draw_grid_line(QPointF(cx, y1), QPointF(cx + cw, y1))
+        _draw_grid_line(QPointF(cx, y2), QPointF(cx + cw, y2))
+
+        # 3. 裁切取景框外缘实线 + 四角战术直角手柄
+        painter.setPen(QPen(QColor(255, 255, 255, 140), 1.0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(crop_rect)
+
+        # 强化四角粗手柄 (明示可拖动缩放)
+        handle_len = min(18.0, cw * 0.15, ch * 0.15)
+        painter.setPen(QPen(QColor(56, 189, 248), 2.5))
+        # Top-Left
+        painter.drawLine(QPointF(cx, cy), QPointF(cx + handle_len, cy))
+        painter.drawLine(QPointF(cx, cy), QPointF(cx, cy + handle_len))
+        # Top-Right
+        painter.drawLine(QPointF(cx + cw, cy), QPointF(cx + cw - handle_len, cy))
+        painter.drawLine(QPointF(cx + cw, cy), QPointF(cx + cw, cy + handle_len))
+        # Bottom-Left
+        painter.drawLine(QPointF(cx, cy + ch), QPointF(cx + handle_len, cy + ch))
+        painter.drawLine(QPointF(cx, cy + ch), QPointF(cx, cy + ch - handle_len))
+        # Bottom-Right
+        painter.drawLine(QPointF(cx + cw, cy + ch), QPointF(cx + cw - handle_len, cy + ch))
+        painter.drawLine(QPointF(cx + cw, cy + ch), QPointF(cx + cw, cy + ch - handle_len))
+
+        # 4. 左上角比例铭牌 (实时跟随当前真实动态比值)
+        tag_str = self._get_live_crop_aspect_text()
+        font = QFont("Consolas", 10, QFont.Bold)
+        painter.setFont(font)
+        fm = QFontMetrics(font)
+        tw = fm.horizontalAdvance(tag_str) + 10
+        tag_box = QRectF(cx + 4, cy + 4, tw, 19)
+        painter.fillRect(tag_box, QColor(0, 0, 0, 200))
+        painter.setPen(QPen(QColor(56, 189, 248, 160), 1.0))
+        painter.drawRect(tag_box)
+        painter.setPen(QColor(56, 189, 248))
+        painter.drawText(tag_box, Qt.AlignCenter, tag_str)
+
+        painter.restore()
         
 
 # ==============================================================================
@@ -4145,7 +4854,7 @@ class AlbumPageWidget(QWidget):
         b_layout = QHBoxLayout(bottom_bar)
         b_layout.setContentsMargins(12, 4, 12, 4)
 
-        lbl_hint = QLabel("💡 提示：双击进入大图检视；【R】眼部特写；【0~5】DPP 式打星；【H】选入暗房")
+        lbl_hint = QLabel("💡 提示：双击进入大图检视；【R】特写；【Q】构图辅助；【W】裁切；【0~5】打星；【H】选入暗房")
         lbl_hint.setStyleSheet("color: #71717a; font-size: 11px;")
         b_layout.addWidget(lbl_hint)
 
@@ -4236,6 +4945,10 @@ class AlbumPageWidget(QWidget):
         tool_capsule_l.addWidget(self.photo_viewer.btn_eye_zoom)
         tool_capsule_l.addWidget(self.photo_viewer.btn_af_toggle)
         tool_capsule_l.addWidget(self.photo_viewer.btn_compare)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_grid_toggle)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_crop_toggle)
+        tool_capsule_l.addWidget(self.photo_viewer.combo_crop_ratio)
+        tool_capsule_l.addWidget(self.photo_viewer.lbl_crop_live_ratio)
         tool_capsule_l.addWidget(self.photo_viewer.lbl_target_badge)
         self.row2_viewer_layout.addWidget(tool_capsule)
 
@@ -4759,6 +5472,8 @@ class DarkroomPageWidget(QWidget):
         tool_capsule_l.addWidget(self.photo_viewer.btn_eye_zoom)
         tool_capsule_l.addWidget(self.photo_viewer.btn_af_toggle)
         tool_capsule_l.addWidget(self.photo_viewer.btn_compare)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_grid_toggle)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_crop_toggle)
         tool_capsule_l.addWidget(self.photo_viewer.lbl_target_badge)
         self.viewer_layout.addWidget(tool_capsule)
 

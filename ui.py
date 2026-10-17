@@ -10,8 +10,8 @@ from PySide6.QtWidgets import (
     QTextEdit, QFrame, QMessageBox, QGroupBox, QStackedWidget, QComboBox,
     QTabWidget, QDialog
 )
-from PySide6.QtCore import Qt, Signal, QSettings
-from PySide6.QtGui import QTextCursor, QDragEnterEvent, QDragMoveEvent, QDragLeaveEvent, QDropEvent
+from PySide6.QtCore import Qt, Signal, QSettings, QUrl
+from PySide6.QtGui import QTextCursor, QDragEnterEvent, QDragMoveEvent, QDragLeaveEvent, QDropEvent, QDesktopServices
 
 from raw_sorter import RawSorterWorker
 from album import (
@@ -206,6 +206,15 @@ QTabBar::tab:selected {
     background-color: #141418;
     color: #38bdf8;
     border-bottom: 2px solid #38bdf8;
+}
+
+QScrollArea {
+    background-color: transparent;
+    border: none;
+}
+
+QScrollArea > QWidget > QWidget {
+    background-color: transparent;
 }
 """
 
@@ -640,6 +649,10 @@ class SettingsPageWidget(QWidget):
         shortcut_page = self._build_shortcut_page()
         self.settings_tabs.addTab(shortcut_page, "快捷键映射")
 
+        # ---------------- 子页 4: 关于与许可 (独立关于子页) ----------------
+        about_page = self._build_about_page()
+        self.settings_tabs.addTab(about_page, "关于与许可")
+
         layout.addWidget(self.settings_tabs)
 
         settings = QSettings("AnicropGeeks", "AnicropStudio")
@@ -863,6 +876,125 @@ class SettingsPageWidget(QWidget):
         scroll.setWidget(page)
         return scroll
 
+    def _build_about_page(self) -> QWidget:
+        from PySide6.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(14)
+
+        group_about = QGroupBox("📜 关于项目与开源协议")
+        about_layout = QVBoxLayout(group_about)
+        about_layout.setSpacing(12)
+        about_layout.setContentsMargins(16, 18, 16, 16)
+
+        lbl_app_info = QLabel("Anicrop Studio (Beta 1.0.0)")
+        lbl_app_info.setStyleSheet("font-size: 15px; font-weight: bold; color: #38bdf8;")
+        about_layout.addWidget(lbl_app_info)
+
+
+        lbl_desc = QLabel(
+            "Anicrop Studio 是一款专为二次元漫展返图流与高频选片打造的高性能本地工作台。\n"
+            "本项目基于 Apache License 2.0 协议完全免费开源，不包含任何商业收费模块，且不收集、不上报用户照片及隐私数据。"
+        )
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setStyleSheet("color: #d4d4d8; font-size: 12px; line-height: 1.5;")
+        about_layout.addWidget(lbl_desc)
+
+        # 防倒卖与版权警示框
+        notice_frame = QFrame()
+        notice_frame.setStyleSheet("""
+            QFrame {
+                background-color: #1c1917;
+                border: 1px solid #78350f;
+                border-radius: 6px;
+                padding: 12px;
+            }
+            QLabel {
+                color: #fbbf24;
+                font-size: 12px;
+                line-height: 1.5;
+            }
+        """)
+        notice_layout = QVBoxLayout(notice_frame)
+        notice_layout.setContentsMargins(8, 6, 8, 6)
+        lbl_notice = QLabel(
+            "⚠️ 正版与防侵权声明：\n"
+            "本软件源代码与便携发布包仅在官方 GitHub 仓库和作者粉丝群公开分发，以及作者内部测试包私发。\n"
+            "根据 Apache License 2.0 条款，任何二次分发、衍生开发均须保留原始版权声明及许可证文本。\n"
+            "若您通过电商平台或其他有偿渠道购买了本软件，说明该渠道存在违规侵权销售行为，建议向平台举报并申请全额退款。"
+        )
+        lbl_notice.setWordWrap(True)
+        notice_layout.addWidget(lbl_notice)
+        about_layout.addWidget(notice_frame)
+
+        # 官方直达跳转按钮组
+        links_layout = QHBoxLayout()
+        links_layout.setSpacing(10)
+
+        btn_repo = QPushButton("🌐 GitHub 官方开源仓库")
+        btn_repo.setStyleSheet("""
+            QPushButton {
+                background-color: #0284c7;
+                color: #ffffff;
+                font-weight: bold;
+                padding: 7px 16px;
+                font-size: 12px;
+                border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #0369a1; }
+        """)
+        btn_repo.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/R4ksh4/AnicropStudio")))
+        links_layout.addWidget(btn_repo)
+
+        btn_releases = QPushButton("📦 历史版本下载和更新")
+        btn_releases.setStyleSheet("""
+            QPushButton {
+                background-color: #27272a;
+                color: #e4e4e7;
+                font-weight: 500;
+                padding: 7px 16px;
+                font-size: 12px;
+                border: 1px solid #3f3f46;
+                border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #3f3f46; color: #38bdf8; }
+        """)
+        btn_releases.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/R4ksh4/AnicropStudio/tags")))
+        links_layout.addWidget(btn_releases)
+
+        btn_author = QPushButton("👤 开发者主页 (R4ksh4)")
+        btn_author.setStyleSheet("""
+            QPushButton {
+                background-color: #27272a;
+                color: #e4e4e7;
+                font-weight: 500;
+                padding: 7px 16px;
+                font-size: 12px;
+                border: 1px solid #3f3f46;
+                border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #3f3f46; color: #38bdf8; }
+        """)
+        btn_author.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/R4ksh4")))
+        links_layout.addWidget(btn_author)
+        lbl_signature = QLabel("Design by R4ksh4")
+        lbl_signature.setStyleSheet("font-size: 20px; font-weight: 600;  font-family: Consolas, 'Segoe UI', monospace; margin-top: 4px;")
+        about_layout.addWidget(lbl_signature)
+
+        links_layout.addStretch()
+        about_layout.addLayout(links_layout)
+
+        v.addWidget(group_about)
+        v.addStretch()
+
+        scroll.setWidget(page)
+        return scroll
+
     def _capture_shortcut(self, action: str, btn: QPushButton):
         dlg = _KeyCaptureDialog(self)
         if dlg.exec() != QDialog.Accepted or not dlg.key_name:
@@ -990,7 +1122,7 @@ class SettingsPageWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Anicrop Studio - 二次元漫展返图流极客工作台 [Alpha 3.0.0]")
+        self.setWindowTitle("Anicrop Studio - 二次元漫展返图流极客工作台 [Beta 1.0.0]")
         self.resize(1320, 880)
         self.setMinimumSize(1024, 720)
         self.setStyleSheet(DARK_STYLE_SHEET)
