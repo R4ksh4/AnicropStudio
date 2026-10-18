@@ -892,7 +892,7 @@ class SettingsPageWidget(QWidget):
         about_layout.setSpacing(12)
         about_layout.setContentsMargins(16, 18, 16, 16)
 
-        lbl_app_info = QLabel("Anicrop Studio (Beta 1.0.0)")
+        lbl_app_info = QLabel("Anicrop Studio (Beta 1.0.1)")
         lbl_app_info.setStyleSheet("font-size: 15px; font-weight: bold; color: #38bdf8;")
         about_layout.addWidget(lbl_app_info)
 
@@ -1122,7 +1122,7 @@ class SettingsPageWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Anicrop Studio - 二次元漫展返图流极客工作台 [Beta 1.0.0]")
+        self.setWindowTitle("Anicrop Studio - 二次元漫展返图流极客工作台 [Beta 1.0.1]")
         self.resize(1320, 880)
         self.setMinimumSize(1024, 720)
         self.setStyleSheet(DARK_STYLE_SHEET)
