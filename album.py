@@ -2542,10 +2542,10 @@ class SinglePhotoViewer(QWidget):
                     self.btn_mark_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #52525b; border-radius: 4px; font-weight: bold; padding: 4px 10px; color: #22c55e; } QPushButton:hover { background-color: #27272a; }")
         else:
             if is_marked:
-                self.btn_mark_toggle.setText(f"✓ 已选入暗房 (按 {load_shortcuts()['mark']} 取消)")
+                self.btn_mark_toggle.setText(f"✓ 已选择照片 (按 {load_shortcuts()['mark']} 取消)")
                 self.btn_mark_toggle.setStyleSheet("QPushButton { background-color: #0369a1; border: 1px solid #38bdf8; border-radius: 4px; font-weight: bold; padding: 4px 10px; color: #ffffff; }")
             else:
-                self.btn_mark_toggle.setText(f"+ 选入暗房 (按 {load_shortcuts()['mark']} 勾选)")
+                self.btn_mark_toggle.setText(f"+ 选择照片 (按 {load_shortcuts()['mark']} 勾选)")
                 self.btn_mark_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #52525b; border-radius: 4px; font-weight: bold; padding: 4px 10px; color: #a1a1aa; } QPushButton:hover { background-color: #27272a; }")
 
     def update_rating_label(self, rating: int):
@@ -3238,13 +3238,11 @@ class SinglePhotoViewer(QWidget):
 
                 painter.save()
                 painter.setClipRect(pr)
-                if self.grid_mode > 0:
+                painter.drawPixmap(QRectF(draw_x, draw_y, draw_w, draw_h).toRect(), pm)
+
+                if self.grid_mode > 0 and not self.crop_active:
                     painter.device().spiral_orientation = getattr(self, "spiral_orientation", 0)
                     self._draw_lumia_grid(painter, QRectF(draw_x, draw_y, draw_w, draw_h), self.grid_mode)
-
-                if self.crop_mode > 0 and self._CROP_RATIOS[self.crop_mode]:
-                    self._draw_precrop_mask(painter, QRectF(draw_x, draw_y, draw_w, draw_h), self._CROP_RATIOS[self.crop_mode])
-                painter.drawPixmap(QRectF(draw_x, draw_y, draw_w, draw_h).toRect(), pm)
 
                 af_boxes = self.current_af_boxes if pane == 0 else self.compare_af_boxes
                 if self.show_af_points and af_boxes:
