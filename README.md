@@ -176,3 +176,5 @@ numpy>=1.24.0
 ## 开源协议
 
 本项目基于 [Apache License 2.0](LICENSE) 协议开源。
+
+Design By R4ksh4
