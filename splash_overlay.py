@@ -16,7 +16,7 @@ from PySide6.QtGui import QPainter, QColor, QFont
 
 
 BOOT_LINES = [
-    ("Anicrop Studio Kernel Beta 1.0.1", 0.15),
+    ("Anicrop Studio Kernel Beta 2.0.0", 0.15),
     ("Copyright (c) 2026 R4ksh4. All rights reserved.", 0.10),
     ("", 0.08),
     ("[    0.000000] Booting Anicrop Studio...", 0.12),
