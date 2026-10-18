@@ -1,6 +1,7 @@
 # 1. 编译构建废料与成品大包
 build/
 dist/
+ico/
 photoai.zip
 *.zip
 *.7z

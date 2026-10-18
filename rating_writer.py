@@ -18,6 +18,50 @@ XMP_UUID = bytes.fromhex('BE7ACFCB97A942E89C71999491E3AFAC')  # 标准 XMP uuid
 _ATTR_RE = re.compile(rb'(xmp:Rating\s*=\s*")(-?\d+)(")')
 _ELEM_RE = re.compile(rb'(<xmp:Rating>)(-?\d+)(</xmp:Rating>)')
 
+def _is_xmp_sidecar_enabled() -> bool:
+    try:
+        from PySide6.QtCore import QSettings
+        st = QSettings("AnicropGeeks", "AnicropStudio")
+        return st.value("enable_xmp_sidecar", False, type=bool)
+    except Exception:
+        return False
+
+
+def _sync_xmp_sidecar(path: Path, rating: int):
+    """
+    针对 A6500 等老款微单的 Lightroom 伴侣文件同步机：
+    1. 仅在设置勾选开启时生效，默认绝对不污染文件夹；
+    2. rating > 0 时写入/更新伴侣文件；
+    3. rating == 0 (清除打星) 且属于本软件生成的纯净伴侣时，自动物理删除，不留残尸！
+    """
+    if not _is_xmp_sidecar_enabled():
+        return
+
+    sidecar = path.with_suffix('.xmp')
+    try:
+        if rating > 0:
+            if sidecar.exists():
+                data = sidecar.read_bytes()
+                new_data = _patch_packet(data, rating) or _minimal_packet(rating)
+                _atomic_write(sidecar, new_data)
+            else:
+                _atomic_write(sidecar, _minimal_packet(rating))
+        else:
+            # 清除星级时，如果伴侣文件存在
+            if sidecar.exists():
+                data = sidecar.read_bytes()
+                # 如果是 AnicropStudio 建立的轻量伴侣，直接干净利落扬了
+                if b'x:xmptk="AnicropStudio"' in data:
+                    try:
+                        sidecar.unlink()
+                    except Exception:
+                        pass
+                else:
+                    new_data = _patch_packet(data, 0)
+                    if new_data:
+                        _atomic_write(sidecar, new_data)
+    except Exception:
+        pass
 
 def _minimal_packet(rating: int) -> bytes:
     """无 XMP 包时的最小合规包 (DPP / Lightroom 均可识别)"""
@@ -59,12 +103,13 @@ def _patch_packet(packet: bytes, rating: int) -> bytes | None:
 
 
 def _atomic_write(path: Path, data: bytes) -> tuple[bool, str]:
-    st = path.stat()
+    st = path.stat() if path.exists() else None
     tmp = path.parent / (path.name + '.anicrop_tmp')
     try:
         with open(tmp, 'wb') as f:
             f.write(data)
-        os.utime(tmp, (st.st_atime, st.st_mtime))
+        if st is not None:
+            os.utime(tmp, (st.st_atime, st.st_mtime))
         os.replace(tmp, path)
         return True, "OK"
     except Exception as e:

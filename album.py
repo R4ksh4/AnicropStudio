@@ -29,7 +29,7 @@ from PySide6.QtCore import (
     QAbstractListModel, QModelIndex, Signal, Slot, QObject, QThread, QSettings, QEvent, QTimer
 )
 from focus_inspector import FocusInspector
-from rating_writer import write_photo_rating
+from rating_writer import write_photo_rating, _minimal_packet
 from sony_af import extract_sony_af_points, _sony_af_core, _sony_af_from_jpeg_bytes
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush, QPixmap, 
@@ -4613,6 +4613,7 @@ class DarkroomExportWorker(QThread):
         smb_copied_count = 0
         orphan_count = 0
 
+        enable_xmp = self.config.get("enable_xmp_sidecar", True)
         if enable_raw or smb_cr3_dir:
             for p_str in self.unhidden_photos:
                 src = Path(p_str)
@@ -4624,13 +4625,30 @@ class DarkroomExportWorker(QThread):
 
                 if raw_file:
                     self.sig_progress.emit(cur_step, total_steps, f"匹配生肉 RAW: {raw_file.name}")
+                    r = parse_photo_rating(str(raw_file)) or parse_photo_rating(str(src))
+
                     if cr3_dir:
-                        shutil.copy2(raw_file, cr3_dir / raw_file.name)
+                        dst_raw = cr3_dir / raw_file.name
+                        shutil.copy2(raw_file, dst_raw)
                         cr3_copied_count += 1
+                        # 仅在导出目标目录下创建 1KB .xmp 伴侣文件送过去，本地原图绝不污染
+                        if enable_xmp and r > 0:
+                            try:
+                                dst_raw.with_suffix('.xmp').write_bytes(_minimal_packet(r))
+                            except Exception:
+                                pass
+
                     if smb_cr3_dir:
                         try:
-                            shutil.copy2(raw_file, smb_cr3_dir / raw_file.name)
+                            smb_dst_raw = smb_cr3_dir / raw_file.name
+                            shutil.copy2(raw_file, smb_dst_raw)
                             smb_copied_count += 1
+                            # 同步送达移动端 / iPad 共享目录
+                            if enable_xmp and r > 0:
+                                try:
+                                    smb_dst_raw.with_suffix('.xmp').write_bytes(_minimal_packet(r))
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                 else:
@@ -6134,6 +6152,7 @@ class DarkroomPageWidget(QWidget):
                 "name_selected_jpg": str(settings.value("export_name_selected_jpg", "jpg2")),
                 "enable_raw": settings.value("export_enable_raw", True, type=bool),
                 "name_raw": str(settings.value("export_name_raw", "cr3")),
+                "enable_xmp_sidecar": settings.value("enable_xmp_sidecar", True, type=bool),
             }
 
             self.progress_dlg = QDialog(self)

@@ -491,6 +491,18 @@ class SettingsPageWidget(QWidget):
         hint_raw.setStyleSheet("color: #71717a; font-size: 11px;")
         gp_layout.addWidget(hint_raw)
 
+        # 导出时为 A6500 等老机型附带 .xmp 伴侣文件
+        self.cb_xmp_sidecar = QCheckBox("导出时附带同名 .xmp 伴侣文件 (本地不创建，仅导出时送达交付目录)")
+        _st_sc = QSettings("AnicropGeeks", "AnicropStudio")
+        self.cb_xmp_sidecar.setChecked(_st_sc.value("enable_xmp_sidecar", True, type=bool))
+        self.cb_xmp_sidecar.setStyleSheet("color: #e4e4e7; font-weight: 500; margin-top: 6px;")
+        self.cb_xmp_sidecar.toggled.connect(lambda val: QSettings("AnicropGeeks", "AnicropStudio").setValue("enable_xmp_sidecar", val))
+        gp_layout.addWidget(self.cb_xmp_sidecar)
+
+        hint_xmp = QLabel("💡 提示：本地打星 100% 纯净零污染；仅在暗房一键导出时，在交付目录 (cr3 / iPad共享) 中自动伴随生成 1KB .xmp 文件供 Lightroom / 移动端识别。")
+        hint_xmp.setStyleSheet("color: #71717a; font-size: 11px;")
+        gp_layout.addWidget(hint_xmp)
+
         gp_layout.addWidget(QLabel("🧪 4. 暗房选片模式选择 (决定初始状态与选片心流):"))
         self.combo_cull_mode = QComboBox()
         self.combo_cull_mode.addItem("批量亮片选暗片（默认全保留，手动剔除废片）", "reject")
@@ -502,7 +514,7 @@ class SettingsPageWidget(QWidget):
         self.lbl_restart_hint.setStyleSheet("color: #71717a; font-size: 11px;")
         gp_layout.addWidget(self.lbl_restart_hint)
 
-        gp_layout.addWidget(QLabel("🗄️ 4. 缩略图缓存 (.cache):"))
+        gp_layout.addWidget(QLabel("🗄️ 5. 缩略图缓存 (.cache):"))
         self.lbl_cache_path = QLabel()
         self.lbl_cache_path.setStyleSheet("color: #38bdf8; font-size: 11px; font-family: Consolas, monospace;")
         self.lbl_cache_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -528,7 +540,7 @@ class SettingsPageWidget(QWidget):
         gp_layout.addWidget(hint3)
 
 # ---------------- 导出规则与命名自定义 (修复 QSS 污染 + 支持默认路径) ----------------
-        gp_layout.addWidget(QLabel("📦 5. 暗房导出规则、命名定制与默认路径:"))
+        gp_layout.addWidget(QLabel("📦 6. 暗房导出规则、命名定制与默认路径:"))
         
         export_box = QFrame()
         export_box.setObjectName("ExportBox")
