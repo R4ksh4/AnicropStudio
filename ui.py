@@ -439,7 +439,59 @@ class SettingsPageWidget(QWidget):
         hint_scroll.setStyleSheet("color: #71717a; font-size: 11px;")
         gp_layout.addWidget(hint_scroll)
 
-        gp_layout.addWidget(QLabel("🧪 3. 暗房选片模式选择 (决定初始状态与选片心流):"))
+        from raw_fusion import (
+            is_raw_decode_enabled, set_raw_decode_enabled,
+            get_raw_decode_scope, set_raw_decode_scope,
+            has_shown_raw_warning, set_shown_raw_warning, RAW_COLOR_WARNING_MSG
+        )
+        gp_layout.addWidget(QLabel("🎞️ 3. RAW 格式反马赛克硬件解析引擎 (解决老微单 1080P 草图):"))
+        
+        raw_box = QFrame()
+        raw_box.setStyleSheet("background-color: #18181e; border: 1px solid #27272f; border-radius: 6px; padding: 10px;")
+        raw_box_layout = QVBoxLayout(raw_box)
+        raw_box_layout.setSpacing(8)
+
+        self.cb_raw_decode_enable = QCheckBox("开启 RAW 硬件反马赛克解析 (提供传感器物理满血锐度)")
+        self.cb_raw_decode_enable.setChecked(is_raw_decode_enabled())
+        self.cb_raw_decode_enable.setStyleSheet("color: #38bdf8; font-weight: bold;")
+        raw_box_layout.addWidget(self.cb_raw_decode_enable)
+
+        h_scope = QHBoxLayout()
+        h_scope.addWidget(QLabel("解析范围:"))
+        self.combo_raw_scope = QComboBox()
+        self.combo_raw_scope.addItem("👁️ 仅人脸 / 双眼特写区域 (按 R 键或放大时解析，兼顾秒开与验焦)", "face")
+        self.combo_raw_scope.addItem("🔬 整张照片全量解析 (切图全量反马赛克，输出满血 2400W 像素)", "full")
+        self.combo_raw_scope.setEnabled(self.cb_raw_decode_enable.isChecked())
+        idx_sc = self.combo_raw_scope.findData(get_raw_decode_scope())
+        if idx_sc >= 0: self.combo_raw_scope.setCurrentIndex(idx_sc)
+        h_scope.addWidget(self.combo_raw_scope, stretch=1)
+        raw_box_layout.addLayout(h_scope)
+
+        def _on_toggle_raw_enable(checked: bool):
+            # 开启时强制弹出警告确认，点“否”直接退回，绝不被注册表已读状态吞掉
+            if checked:
+                ret = QMessageBox.warning(
+                    self, "RAW 解析与色彩原理说明", RAW_COLOR_WARNING_MSG,
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if ret != QMessageBox.Yes:
+                    self.cb_raw_decode_enable.blockSignals(True)
+                    self.cb_raw_decode_enable.setChecked(False)
+                    self.cb_raw_decode_enable.blockSignals(False)
+                    return
+
+            set_raw_decode_enabled(checked)
+            self.combo_raw_scope.setEnabled(checked)
+
+        self.cb_raw_decode_enable.toggled.connect(_on_toggle_raw_enable)
+        self.combo_raw_scope.currentIndexChanged.connect(lambda: set_raw_decode_scope(self.combo_raw_scope.currentData()))
+        gp_layout.addWidget(raw_box)
+
+        hint_raw = QLabel("💡 提示：关闭时为 0ms 纯机内直出图；开启时提供传感器物理级满血锐度（仅可在设置中配置，大图模式不可更改）。")
+        hint_raw.setStyleSheet("color: #71717a; font-size: 11px;")
+        gp_layout.addWidget(hint_raw)
+
+        gp_layout.addWidget(QLabel("🧪 4. 暗房选片模式选择 (决定初始状态与选片心流):"))
         self.combo_cull_mode = QComboBox()
         self.combo_cull_mode.addItem("批量亮片选暗片（默认全保留，手动剔除废片）", "reject")
         self.combo_cull_mode.addItem("批量暗片选亮片（默认全压暗，手动精选好片）", "pick")

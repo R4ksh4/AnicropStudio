@@ -1,5 +1,12 @@
 from sony_af import extract_sony_af_points, _sony_af_core, _sony_af_from_jpeg_bytes
 from nikon_af import _nikon_af_core
+from raw_fusion import (
+    is_rawpy_available, is_low_res_raw_preview, 
+    get_raw_decode_mode, set_raw_decode_mode, AsyncRawFusionWorker,
+    is_raw_decode_enabled, set_raw_decode_enabled, get_raw_decode_scope,
+    has_shown_raw_warning, set_shown_raw_warning, RAW_COLOR_WARNING_MSG,
+    fuse_raw_with_sooc_color
+)
 import os
 import sys
 import math
@@ -43,7 +50,7 @@ DEFAULT_SHORTCUTS = {
     "cmp_l_next":     ("I", "对比 - 左图下一张", ""),
     "cmp_r_prev":     ("O", "对比 - 右图上一张", ""),
     "cmp_r_next":     ("P", "对比 - 右图下一张", ""),
-    "mark":           ("H", "标记 / 取消标记 (选片/废片)", "X / Delete / S"),
+    "mark":           ("H", "标记 / 取消标记 (选片/废片)", "X / Delete"),
     "eye_zoom":       ("R", "眼部特写 开/关", "鼠标双击"),
     "af":             ("F", "对焦点显示 开/关", ""),
     "compare":        ("C", "对比模式 开/关", ""),
@@ -107,13 +114,97 @@ def _extract_cr2_embedded_jpeg(data: bytes) -> bytes:
     return b""
 
 
+def _extract_sony_embedded_jpeg(data: bytes) -> bytes:
+    """
+    索尼 (Sony ARW) 原厂定点预览提取引擎:
+    深度解析 TIFF IFD0 -> SubIFDs (Tag 0x014A) -> Tag 0x0201 (JPEGInterchangeFormat)
+    与 Tag 0x0202 (JPEGInterchangeFormatLength)，定点精准拿图，
+    彻底解决 A6500 / A6000 / A7 等机型因内部自带缩略图导致字节盲搜被提前腰斩的顽疾。
+    """
+    if len(data) < 64 or data[:4] not in (b'II*\x00', b'MM\x00*'):
+        return b""
+
+    endian = '<' if data[:2] == b'II' else '>'
+    try:
+        ifd0_off = struct.unpack(endian + 'I', data[4:8])[0]
+        if ifd0_off <= 0 or ifd0_off + 2 > len(data):
+            return b""
+
+        candidates = []
+        visited = set()
+        queue = [ifd0_off]
+
+        while queue and len(visited) < 16:
+            cur_ifd = queue.pop(0)
+            if cur_ifd in visited or cur_ifd <= 0 or cur_ifd + 2 > len(data):
+                continue
+            visited.add(cur_ifd)
+
+            num_entries = struct.unpack(endian + 'H', data[cur_ifd : cur_ifd + 2])[0]
+            if num_entries <= 0 or num_entries > 350 or cur_ifd + 2 + num_entries * 12 > len(data):
+                continue
+
+            t_off, t_len = 0, 0
+
+            for i in range(num_entries):
+                ep = cur_ifd + 2 + i * 12
+                tag = struct.unpack(endian + 'H', data[ep : ep + 2])[0]
+                count = struct.unpack(endian + 'I', data[ep + 4 : ep + 8])[0]
+                val_bytes = data[ep + 8 : ep + 12]
+
+                if tag == 0x0201:      # JPEGInterchangeFormat (JPEG 绝对起始偏移)
+                    t_off = struct.unpack(endian + 'I', val_bytes)[0]
+                elif tag == 0x0202:    # JPEGInterchangeFormatLength (JPEG 绝对字节长度)
+                    t_len = struct.unpack(endian + 'I', val_bytes)[0]
+                elif tag == 0x014A:    # SubIFDs (索尼子表跳转指针)
+                    if count == 1:
+                        sub_ptr = struct.unpack(endian + 'I', val_bytes)[0]
+                        if sub_ptr not in visited:
+                            queue.append(sub_ptr)
+                    elif count > 1:
+                        sub_list_off = struct.unpack(endian + 'I', val_bytes)[0]
+                        if sub_list_off + count * 4 <= len(data):
+                            for k in range(min(count, 8)):
+                                s_ptr = struct.unpack(endian + 'I', data[sub_list_off + k * 4 : sub_list_off + (k + 1) * 4])[0]
+                                if s_ptr not in visited:
+                                    queue.append(s_ptr)
+
+            if t_off > 0 and t_len > 2048 and t_off + t_len <= len(data):
+                cand = data[t_off : t_off + t_len]
+                if cand.startswith(b'\xff\xd8'):
+                    candidates.append((t_len, cand))
+
+            # 遍历 TIFF 链表下一个 IFD (如 IFD1 缩略图)
+            nxt_pos = cur_ifd + 2 + num_entries * 12
+            if nxt_pos + 4 <= len(data):
+                nxt_ifd = struct.unpack(endian + 'I', data[nxt_pos : nxt_pos + 4])[0]
+                if nxt_ifd > 0 and nxt_ifd not in visited:
+                    queue.append(nxt_ifd)
+
+        if candidates:
+            # 挑体积最大的预览（自动排除 160x120 的微型缩略图，锁定 SubIFD 里的完整预览大图）
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return candidates[0][1]
+
+    except Exception:
+        pass
+
+    return b""
+
+
 def _scan_embedded_jpeg(data: bytes) -> bytes:
-    """【不解析 RAW】直接在二进制流中扫描内嵌 JPEG。对 CR2 走定点解剖，其他走最长段扫描。"""
-    # 优先拦截佳能单反 CR2，毫秒级提取 IFD1 标准预览
+    """【不解析 RAW】直接在二进制流中提取内嵌 JPEG。佳能 CR2 / 索尼 ARW 走硬件级定点解剖，其他走最长段扫描。"""
+    # 1. 优先定点解剖佳能单反 CR2 (IFD0 0x0111 / 0x0117)
     cr2_preview = _extract_cr2_embedded_jpeg(data)
     if cr2_preview:
         return cr2_preview
 
+    # 2. 优先定点解剖索尼微单 ARW (SubIFDs 0x014A -> 0x0201 / 0x0202)
+    sony_preview = _extract_sony_embedded_jpeg(data)
+    if sony_preview:
+        return sony_preview
+
+    # 3. 其他杂牌通用兜底扫描 (增加 APP 长度跳跃，防止被 EXIF 缩略图提早腰斩)
     best = b""
     pos = 0
     n = len(data)
@@ -121,13 +212,26 @@ def _scan_embedded_jpeg(data: bytes) -> bytes:
         soi = data.find(b'\xff\xd8\xff', pos)
         if soi < 0:
             break
-        eoi = data.find(b'\xff\xd9', soi + 3)
+        
+        # 如果带有 APP1/APP2 头，跳过内部自带的小缩略图区域再去搜 EOI
+        search_start = soi + 3
+        if soi + 6 < n and data[soi + 2] in (0xE0, 0xE1, 0xE2):
+            app_len = int.from_bytes(data[soi + 4 : soi + 6], 'big')
+            if app_len > 10:
+                search_start = max(search_start, soi + 4 + app_len)
+
+        eoi = data.find(b'\xff\xd9', search_start)
         if eoi < 0:
-            break
+            # 容错：如果跳跃后没找到，回退普通查找
+            eoi = data.find(b'\xff\xd9', soi + 3)
+            if eoi < 0:
+                break
+
         seg = data[soi : eoi + 2]
         if len(seg) > len(best):
             best = seg
         pos = eoi + 2
+
     return best
 
 def _default_exif_res() -> dict:
@@ -2214,6 +2318,9 @@ class SinglePhotoViewer(QWidget):
         self.current_target_norm = (0.5, 0.5)
         self.current_target_desc = "画面中心"
         self.current_face_rect = None
+        self._raw_fusion_worker = None
+        self._active_fusion_workers = set()
+        self._fused_paths = set()
 
         # 【对比模式状态机】左格=current_index(沿用主字段)，右格=compare_*；键盘跟随鼠标最后点击的窗格
         self.compare_mode = False
@@ -2373,6 +2480,23 @@ class SinglePhotoViewer(QWidget):
         self.btn_crop_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid transparent; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #d4d4d8; } QPushButton:hover { background-color: #27272e; color: #38bdf8; }")
         self.btn_crop_toggle.setToolTip(f"预裁剪交互模式 ({load_shortcuts().get('precrop', 'W')})")
         self.btn_crop_toggle.clicked.connect(self._toggle_crop_active)
+
+        # ---------------- RAW 物理三档切换开关 (不解 / 放大解 / 全解) ----------------
+        self._RAW_MODES = ["eye_zoom", "full", "fast"]
+        self._RAW_MODE_NAMES = {
+            "fast": "⚡ RAW: 不解",
+            "eye_zoom": "🔍 RAW: 放大解",
+            "full": "🔬 RAW: 全解"
+        }
+        self.raw_mode = get_raw_decode_mode() if "get_raw_decode_mode" in globals() else "eye_zoom"
+        self._sooc_pixmap = QPixmap()
+
+        self.btn_raw_mode_toggle = QPushButton(self._RAW_MODE_NAMES.get(self.raw_mode, "🔍 RAW: 放大解"))
+        self.btn_raw_mode_toggle.setVisible(False)
+        self.btn_raw_mode_toggle.setFocusPolicy(Qt.NoFocus)
+        self.btn_raw_mode_toggle.setToolTip("点击切换 RAW 解析策略：不解(极速) ➔ 放大解(验焦按需) ➔ 全解(全图满血)")
+        self._refresh_raw_mode_btn_style()
+        self.btn_raw_mode_toggle.clicked.connect(self._cycle_raw_mode)
 
         self.combo_crop_ratio = QComboBox()
         self.combo_crop_ratio.setVisible(False)
@@ -2586,6 +2710,13 @@ class SinglePhotoViewer(QWidget):
         img = load_photo_qimage(file_path)
         _crashlog(f"[viewer] 解码完成 {img.width()}x{img.height()} null={img.isNull()}")
         self.current_pixmap = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
+        self._sooc_pixmap = QPixmap(self.current_pixmap)
+
+        # RAW 硬件解析策略只在系统设置中调节，大图界面永久不显示按钮
+        self.btn_raw_mode_toggle.setVisible(False)
+        if is_raw_file(file_path):
+            if is_raw_decode_enabled() and get_raw_decode_scope() == "full":
+                self._trigger_raw_fusion_if_needed(file_path, force=True, half_size=False)
 
         if is_raw_file(file_path):
             # RAW：方向/佳能 AF 框从容器 EXIF 照解；人脸雷达直接跑在内嵌预览上（与显示严格同源）
@@ -2637,8 +2768,120 @@ class SinglePhotoViewer(QWidget):
 
         self.sig_photo_changed.emit(file_path, self.current_index, len(self.photo_list))
 
+    def _refresh_raw_mode_btn_style(self):
+        styles = {
+            "fast": "QPushButton { background-color: transparent; border: 1px solid transparent; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #71717a; } QPushButton:hover { background-color: #27272e; color: #d4d4d8; }",
+            "eye_zoom": "QPushButton { background-color: #0c4a6e; border: 1px solid #0284c7; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #38bdf8; } QPushButton:hover { background-color: #0369a1; }",
+            "full": "QPushButton { background-color: #143521; border: 1px solid #16a34a; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #4ade80; } QPushButton:hover { background-color: #15803d; }"
+        }
+        self.btn_raw_mode_toggle.setText(self._RAW_MODE_NAMES.get(self.raw_mode, "🔍 RAW: 放大解"))
+        self.btn_raw_mode_toggle.setStyleSheet(styles.get(self.raw_mode, styles["eye_zoom"]))
+
+    def _toggle_raw_decode_by_key(self):
+        """按 S 键即时开/关 RAW 硬件解析，初次开启主动弹窗免责警告"""
+        cur_p = self.get_active_path()
+        if not is_raw_file(cur_p):
+            return
+
+        currently_on = is_raw_decode_enabled()
+        target_state = not currently_on
+
+        if target_state and not has_shown_raw_warning():
+            ret = QMessageBox.warning(
+                self, "RAW 解析与色彩原理说明", RAW_COLOR_WARNING_MSG,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if ret != QMessageBox.Yes:
+                return
+            set_shown_raw_warning(True)
+
+        set_raw_decode_enabled(target_state)
+
+        if not target_state:
+            # 关：瞬间切回 1080P 纯正原厂草图
+            if not self._sooc_pixmap.isNull():
+                self.current_pixmap = QPixmap(self._sooc_pixmap)
+            self.lbl_target_badge.setText("⚡ RAW: 未解析 (机内图)")
+            self.lbl_target_badge.setStyleSheet("QLabel { background-color: #142231; color: #a1a1aa; border: 1px solid #3f3f46; border-radius: 2px; padding: 1px 6px; font-size: 11px; font-weight: 600; }")
+            self.btn_raw_mode_toggle.setText("⚡ RAW: 未解析 [S]")
+            self.btn_raw_mode_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid transparent; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #71717a; } QPushButton:hover { background-color: #27272e; color: #d4d4d8; }")
+            self.update()
+        else:
+            # 开：按范围执行解析
+            scope = get_raw_decode_scope()
+            self.btn_raw_mode_toggle.setText(f"🔬 RAW: {'全解' if scope == 'full' else '特写解'} [S]")
+            self.btn_raw_mode_toggle.setStyleSheet("QPushButton { background-color: #143521; border: 1px solid #16a34a; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #4ade80; }")
+            self._trigger_raw_fusion_if_needed(cur_p, force=True, half_size=False)
+
+    def _cycle_raw_mode(self):
+        """点击按钮轮询切换：放大解 ➔ 全解 ➔ 不解 ➔ 放大解"""
+        order = ["eye_zoom", "full", "fast"]
+        cur_idx = order.index(self.raw_mode) if self.raw_mode in order else 0
+        self.raw_mode = order[(cur_idx + 1) % len(order)]
+        set_raw_decode_mode(self.raw_mode)
+        self._refresh_raw_mode_btn_style()
+
+        cur_path = self.get_active_path()
+        if not is_raw_file(cur_path):
+            return
+
+        # 档位即时响应
+        if self.raw_mode == "fast":
+            # 切换为不解：瞬间还原机内原本的 SOOC 预览
+            if not self._sooc_pixmap.isNull():
+                self.current_pixmap = QPixmap(self._sooc_pixmap)
+                self.lbl_target_badge.setText("⚡ 1080P 机内草图")
+                self.lbl_target_badge.setStyleSheet("QLabel { background-color: #142231; color: #a1a1aa; border: 1px solid #3f3f46; border-radius: 2px; padding: 1px 6px; font-size: 11px; font-weight: 600; }")
+                self.update()
+        elif self.raw_mode == "full":
+            # 切换为全解：立即触发全尺寸融合
+            self._trigger_raw_fusion_if_needed(cur_path, force=True, half_size=False)
+        elif self.raw_mode == "eye_zoom":
+            # 切换为放大解：如果是特写中立即触发，否则恢复底图
+            if self.is_eye_zoom_mode or self.zoom_factor > 1.2:
+                self._trigger_raw_fusion_if_needed(cur_path, force=True, half_size=True)
+            elif not self._sooc_pixmap.isNull():
+                self.current_pixmap = QPixmap(self._sooc_pixmap)
+                self.update()
+
+    def _trigger_raw_fusion_if_needed(self, file_path: str, force: bool = False, half_size: bool = True):
+        """核心融合触发器：根据档位将 RAW 传感器的高频细节无缝灌入机内直出图"""
+        if not is_raw_file(file_path) or not is_rawpy_available():
+            return
+        if not force and file_path in self._fused_paths:
+            return
+        if not force and not is_raw_decode_enabled():
+            return
+
+        # 仅对低清预览机型或全解模式触发
+        is_low_res = is_low_res_raw_preview(self._sooc_pixmap.toImage())
+        if not is_low_res and self.raw_mode != "full" and not force:
+            return
+
+        base_img = self._sooc_pixmap.toImage() if not self._sooc_pixmap.isNull() else self.current_pixmap.toImage()
+        
+        # 建立存续保险：防止旧线程被 Python GC 析构导致 Qt 报 qFatal 闪退
+        worker = AsyncRawFusionWorker(file_path, base_img, half_size=False)
+        self._active_fusion_workers.add(worker)
+        self._raw_fusion_worker = worker
+
+        def _on_fused(path, fused_qimg, w=worker):
+            self._active_fusion_workers.discard(w)
+            if path == self.get_active_path() and not fused_qimg.isNull():
+                self._fused_paths.add(path)
+                self.current_pixmap = QPixmap.fromImage(fused_qimg)
+                self.update()
+
+        worker.sig_fused_ready.connect(_on_fused)
+        worker.finished.connect(lambda w=worker: self._active_fusion_workers.discard(w))
+        worker.start()
+
     def _apply_eye_zoom(self):
         """视网膜自适应特写：精准绑定当前激活窗口，单格特写，绝不动另一格！"""
+        cur_path = self.get_active_path()
+        if cur_path:
+            self._trigger_raw_fusion_if_needed(cur_path)
+
         if self.compare_mode:
             pane = self.active_pane
             pr = self._pane_rect(pane)
@@ -3722,9 +3965,10 @@ class SinglePhotoViewer(QWidget):
         elif key == k_next:
             self.next_image()
             event.accept()
-        elif key in (k_mark, Qt.Key_X, Qt.Key_Delete, Qt.Key_S):
+        elif key in (k_mark, Qt.Key_X, Qt.Key_Delete):
             self._on_mark_toggle_clicked()
             event.accept()
+        # S 键切换已被物理锁死，RAW 解析统一由「系统设置」接管
         elif event.text() in ("0", "1", "2", "3", "4", "5"):
             path = self.get_active_path()
             if path:
@@ -4229,7 +4473,7 @@ class SinglePhotoViewer(QWidget):
         
 
 # ==============================================================================
-# 暗房一键导出后台工作线程 (支持开关、自定义文件夹名、SMB 分流)
+# 暗房一键导出后台工作线程 (支持开关、自定义文件夹名、SMB 分流与导出前分辨率分析重解)
 # ==============================================================================
 class DarkroomExportWorker(QThread):
     sig_progress = Signal(int, int, str)
@@ -4290,20 +4534,63 @@ class DarkroomExportWorker(QThread):
         skipped_jpg_all = 0
         skipped_jpg2 = 0
 
+        # 预先建立 RAW 源目录索引池，供分辨率过低时自动反向溯源并唤醒满血反马赛克重解
+        raw_index = {}
+        if self.raw_src_dir.exists() and self.raw_src_dir.is_dir():
+            for f in self.raw_src_dir.iterdir():
+                if f.is_file() and f.suffix.lower() in RAW_IMAGE_EXTS:
+                    key = self.normalize_stem(f.stem)
+                    raw_index[key] = f
+
         def _deliver_jpg(src: Path, dst_dir: Path, cur: int, total: int, tag: str) -> bool:
+            raw_target_path = None
+            img = None
+
             if is_raw_file(src):
+                raw_target_path = src
                 img = load_photo_qimage(str(src))
                 if img.isNull():
                     self.sig_progress.emit(cur, total, f"跳过 RAW (无内嵌预览): {src.name}")
                     return False
+            else:
+                # 针对 JPG 也要做一次分辨率哨兵检测 (防之前误把 1080P 小样图选入暗房)
+                reader = QImageReader(str(src))
+                reader.setAutoTransform(True)
+                sz = reader.size()
+                if sz.isValid() and max(sz.width(), sz.height()) <= 2048:
+                    key = self.normalize_stem(src.stem)
+                    if key in raw_index and is_rawpy_available():
+                        raw_target_path = raw_index[key]
+                        img = reader.read()
+
+            # ---------------- 核心：分辨率深度分析 & 满血 RAW 强制逆向重解 ----------------
+            if raw_target_path is not None and is_rawpy_available():
+                if img is None or img.isNull():
+                    img = load_photo_qimage(str(raw_target_path))
+
+                # 索尼老机器 (A6000/A6500/A7M2/A7M3/ZV-E10 等) 内嵌只有 1080P (长边 <= 2048)
+                is_low_res = is_low_res_raw_preview(img) or (max(img.width(), img.height()) <= 2048)
+                if is_low_res or is_raw_decode_enabled():
+                    self.sig_progress.emit(
+                        cur, total,
+                        f"{tag} [分辨率检测: {img.width()}x{img.height()} 属于低清草图 -> 正在进行 RAW 满血反马赛克色彩融合]: {raw_target_path.name}"
+                    )
+                    fused = fuse_raw_with_sooc_color(str(raw_target_path), img, half_size=False)
+                    if not fused.isNull() and (fused.width() > img.width() or fused.height() > img.height()):
+                        img = fused
+
+            # 若通过 RAW 反马赛克融合生成了满血图，保存为 95 质量 JPG
+            if img is not None and not img.isNull():
                 out = dst_dir / (src.stem + ".jpg")
                 try:
-                    if not img.save(str(out), "JPG", 92):
+                    if not img.save(str(out), "JPG", 95):
                         return False
                 except Exception:
                     return False
-                self.sig_progress.emit(cur, total, f"{tag} (RAW转预览): {out.name}")
+                self.sig_progress.emit(cur, total, f"{tag} (满血导出成功 {img.width()}x{img.height()}): {out.name}")
                 return True
+
+            # 正常高分辨率照片 (如相机原生 24MP 直出 JPG) 直接无损快速拷贝
             self.sig_progress.emit(cur, total, f"{tag}: {src.name}")
             shutil.copy2(src, dst_dir / src.name)
             return True
@@ -4327,13 +4614,6 @@ class DarkroomExportWorker(QThread):
         orphan_count = 0
 
         if enable_raw or smb_cr3_dir:
-            raw_index = {}
-            if self.raw_src_dir.exists() and self.raw_src_dir.is_dir():
-                for f in self.raw_src_dir.iterdir():
-                    if f.is_file() and f.suffix.lower() in {".cr3", ".arw"}:
-                        key = self.normalize_stem(f.stem)
-                        raw_index[key] = f
-
             for p_str in self.unhidden_photos:
                 src = Path(p_str)
                 cur_step += 1
