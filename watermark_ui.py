@@ -30,8 +30,23 @@ from PySide6.QtGui import (
 
 
 # ==============================================================================
-# 通用组件 1: 滑块 + 输入微调框 双模联动组件 (加宽至 78px，彻底告别切字)
+# 通用组件 1: 滚轮穿透防误触控件 + 滑块输入微调框
 # ==============================================================================
+class NoWheelSlider(QSlider):
+    def wheelEvent(self, event):
+        event.ignore()  # 忽略滚轮，事件无缝穿透给父级滚动条
+
+
+class NoWheelSpinBox(QSpinBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelComboBox(QComboBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class SliderInputRow(QWidget):
     valueChanged = Signal(int)
 
@@ -46,7 +61,8 @@ class SliderInputRow(QWidget):
         self.lbl.setFixedWidth(112)
         layout.addWidget(self.lbl)
 
-        self.slider = QSlider(Qt.Horizontal)
+        # 换用防滚轮误触的 NoWheelSlider
+        self.slider = NoWheelSlider(Qt.Horizontal)
         self.slider.setRange(min_val, max_val)
         self.slider.setValue(default_val)
         self.slider.setStyleSheet("""
@@ -56,7 +72,8 @@ class SliderInputRow(QWidget):
         """)
         layout.addWidget(self.slider)
 
-        self.spin = QSpinBox()
+        # 换用防滚轮误触的 NoWheelSpinBox
+        self.spin = NoWheelSpinBox()
         self.spin.setRange(min_val, max_val)
         self.spin.setValue(default_val)
         if unit:
@@ -116,10 +133,6 @@ class SliderInputRow(QWidget):
     def setValue(self, val: int):
         self.slider.setValue(val)
 
-
-# ==============================================================================
-# 通用组件 2: 色块 + 调色盘 + Hex 输入框 + 常用预设色
-# ==============================================================================
 class ColorPickerRow(QWidget):
     colorChanged = Signal(str)
 
@@ -1259,7 +1272,7 @@ class WatermarkPageWidget(QWidget):
 
         h_tpl = QHBoxLayout()
         h_tpl.setSpacing(6)
-        self.combo_presets = QComboBox()
+        self.combo_presets = NoWheelComboBox()
         for k, v in self.OFFICIAL_PRESETS.items():
             self.combo_presets.addItem(v["name"], k)
         self.combo_presets.currentIndexChanged.connect(self._on_preset_selected)
@@ -1303,7 +1316,7 @@ class WatermarkPageWidget(QWidget):
 
         h_mode = QHBoxLayout()
         h_mode.addWidget(QLabel("骨架形态:"))
-        self.combo_frame_mode = QComboBox()
+        self.combo_frame_mode = NoWheelComboBox()
         self.combo_frame_mode.addItem("仅底部外延参数栏 (底栏型)", "bottom_bar")
         self.combo_frame_mode.addItem("四周画布包围 (悬浮画心型)", "surround")
         h_mode.addWidget(self.combo_frame_mode, stretch=1)
@@ -1311,7 +1324,7 @@ class WatermarkPageWidget(QWidget):
 
         h_ratio = QHBoxLayout()
         h_ratio.addWidget(QLabel("画面画幅:"))
-        self.combo_ratio = QComboBox()
+        self.combo_ratio = NoWheelComboBox()
         self.combo_ratio.addItem("自由比例 (长宽随留白展开)", "free")
         self.combo_ratio.addItem("保持原图比例 (仅底边等比外延)", "native")
         self.combo_ratio.addItem("3:2 (相机原生 135 全幅横屏)", "3:2")
@@ -1352,7 +1365,7 @@ class WatermarkPageWidget(QWidget):
 
         h_bg_type = QHBoxLayout()
         h_bg_type.addWidget(QLabel("底色类型:"))
-        self.combo_bg_type = QComboBox()
+        self.combo_bg_type = NoWheelComboBox()
         self.combo_bg_type.addItem("纯色背景 (调色盘/Hex)", "solid")
         self.combo_bg_type.addItem("毛玻璃背景 (提取原图自适应模糊)", "blur")
         self.combo_bg_type.addItem("纯透明背景 (导出 PNG 备用)", "transparent")
@@ -1384,7 +1397,7 @@ class WatermarkPageWidget(QWidget):
         h_l_top.addWidget(self.cb_logo_show)
 
         h_l_top.addWidget(QLabel("吸附对齐:"))
-        self.combo_logo_align = QComboBox()
+        self.combo_logo_align = NoWheelComboBox()
         self.combo_logo_align.addItem("靠左对齐 (Left)", "left")
         self.combo_logo_align.addItem("居中对齐 (Center)", "center")
         self.combo_logo_align.addItem("靠右对齐 (Right)", "right")

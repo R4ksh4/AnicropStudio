@@ -1609,10 +1609,96 @@ class ThumbnailTask(QRunnable):
         self.file_path = file_path
         self.target_cache_dir = target_cache_dir
         self.target_size = target_size
-        self.provisional_ok = provisional_ok  # True=预热档：JPG 允许只用 EXIF 小图快速出图，高清图留给升级梯队
+        self.provisional_ok = provisional_ok
         self.signals = ThumbnailSignals()
 
+    def _safe_emit(self, sig, *args):
+        """安全发射器：即便宿主被销毁或 GC，绝不向外抛出任何 RuntimeError"""
+        try:
+            if hasattr(self, 'signals') and self.signals is not None:
+                sig.emit(*args)
+        except (RuntimeError, Exception):
+            pass
+
     def run(self):
+        if is_raw_file(self.file_path):
+            try:
+                _raw_bundle(self.file_path, light=True)
+            except Exception:
+                pass
+        self._safe_emit(self.signals.meta_loaded, self.file_path, parse_photo_rating(self.file_path))
+        try:
+            mtime = os.path.getmtime(self.file_path)
+            hash_str = f"{self.file_path}_{mtime}"
+            cache_key = hashlib.md5(hash_str.encode("utf-8")).hexdigest()
+            cache_file = self.target_cache_dir / f"{cache_key}.jpg"
+
+            if cache_file.exists():
+                img = QImage(str(cache_file))
+                if not img.isNull():
+                    self._safe_emit(self.signals.loaded, self.file_path, img)
+                    return
+
+            if is_raw_file(self.file_path):
+                raw_img = load_photo_qimage(self.file_path, light=True)
+                img = raw_img.scaled(self.target_size, self.target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation) if not raw_img.isNull() else QImage()
+            elif self.provisional_ok:
+                img = None
+                try:
+                    tb, tor = extract_exif_thumb_and_orientation(self.file_path)
+                    if tb:
+                        timg = QImage.fromData(tb)
+                        if not timg.isNull():
+                            if tor == 6:
+                                timg = timg.transformed(QTransform().rotate(90.0))
+                            elif tor == 8:
+                                timg = timg.transformed(QTransform().rotate(-90.0))
+                            elif tor == 3:
+                                timg = timg.transformed(QTransform().rotate(180.0))
+                            timg = timg.scaled(self.target_size, self.target_size, Qt.KeepAspectRatio, Qt.FastTransformation)
+                            self._safe_emit(self.signals.loaded, self.file_path, timg)
+                except Exception:
+                    pass
+                self._safe_emit(self.signals.provisional_used, self.file_path)
+                return
+            elif self.file_path in _POISON_FILES:
+                _crashlog(f"[thumb] 跳过黑名单文件 {self.file_path}")
+                try:
+                    tb, tor = extract_exif_thumb_and_orientation(self.file_path)
+                    if tb:
+                        timg = QImage.fromData(tb)
+                        if not timg.isNull():
+                            if tor == 6:
+                                timg = timg.transformed(QTransform().rotate(90.0))
+                            elif tor == 8:
+                                timg = timg.transformed(QTransform().rotate(-90.0))
+                            elif tor == 3:
+                                timg = timg.transformed(QTransform().rotate(180.0))
+                            self._safe_emit(self.signals.loaded, self.file_path, timg.scaled(
+                                self.target_size, self.target_size, Qt.KeepAspectRatio, Qt.FastTransformation))
+                except Exception:
+                    pass
+                return
+            else:
+                _crashlog(f"[thumb] JPG全量解码开始 {self.file_path}")
+                reader = QImageReader(self.file_path)
+                reader.setAutoTransform(True)
+                orig_size = reader.size()
+                if orig_size.isValid() and orig_size.width() > 0 and orig_size.height() > 0:
+                    scaled_size = orig_size.scaled(self.target_size, self.target_size, Qt.KeepAspectRatio)
+                    reader.setScaledSize(scaled_size)
+                img = reader.read()
+                _crashlog(f"[thumb] JPG全量解码完成 {self.file_path} null={img.isNull()}")
+            if not img.isNull():
+                try:
+                    img.save(str(cache_file), "JPG", 85)
+                except Exception:
+                    pass
+                self._safe_emit(self.signals.loaded, self.file_path, img)
+        except Exception:
+            pass
+        finally:
+            self._safe_emit(self.signals.task_done, self.file_path)
         # RAW 缩略图批量遍历：先预热轻量 bundle（一趟读盘，只抽预览/星级，跳过 TIFF 枚举/EXIF/AF 派生），
         # 随后的 parse_photo_rating / load_photo_qimage 全部命中同一缓存条目
         if is_raw_file(self.file_path):
@@ -1754,6 +1840,7 @@ class AdvancedCardDelegate(QStyledItemDelegate):
         self.hidden_set = set()
         self.is_remove_mode = False
         self.remove_set = set()
+        self.is_trash_view = False  # 是否处于暗房废片篓视图
 
     def set_card_size(self, size: QSize):
         self.card_size = size
@@ -1824,9 +1911,19 @@ class AdvancedCardDelegate(QStyledItemDelegate):
                 painter.drawRoundedRect(img_rect, 6, 6)
 
         if not is_dir:
-            # 【机内打星徽标】金色 ★ 角标，暗房模式避开右上角眼睛按钮
+            # 废片篓模式：右上角绘制专属高亮绿色「↩ 恢复」按钮
+            if self.is_darkroom and self.is_trash_view:
+                rst_rect = QRect(rect.right() - 58, rect.top() + 8, 50, 22)
+                painter.setBrush(QColor(16, 185, 129, 45))
+                painter.setPen(QPen(QColor("#10b981"), 1.2))
+                painter.drawRoundedRect(rst_rect, 4, 4)
+                painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                painter.setPen(QColor("#10b981"))
+                painter.drawText(rst_rect, Qt.AlignCenter, "↩ 恢复")
+
+            # 【机内打星徽标】金色 ★ 角标
             rating_val = self.ratings.get(file_path, 0)
-            if rating_val > 0:
+            if rating_val > 0 and not self.is_trash_view:
                 star_text = "★" * rating_val
                 star_font = QFont("Segoe UI", 9, QFont.Bold)
                 painter.setFont(star_font)
@@ -1849,10 +1946,9 @@ class AdvancedCardDelegate(QStyledItemDelegate):
                     painter.setPen(QPen(QColor("#ffffff"), 2.0))
                     painter.drawLine(box_rect.left() + 4, box_rect.top() + 10, box_rect.left() + 8, box_rect.top() + 15)
                     painter.drawLine(box_rect.left() + 8, box_rect.top() + 15, box_rect.left() + 15, box_rect.top() + 5)
-            elif self.is_remove_mode:
+            elif self.is_remove_mode and not self.is_trash_view:
                 is_marked_remove = file_path in self.remove_set
                 if is_marked_remove:
-                    # 待移出标记：红色描边 + 淡红罩面，一眼识别
                     painter.setBrush(QColor(239, 68, 68, 55))
                     painter.setPen(QPen(QColor("#ef4444"), 2.0))
                     painter.drawRoundedRect(rect, 8, 8)
@@ -1863,6 +1959,23 @@ class AdvancedCardDelegate(QStyledItemDelegate):
                 painter.setPen(QPen(QColor("#ffffff"), 2.0) if is_marked_remove else QPen(QColor("#fca5a5"), 1.6))
                 painter.drawLine(del_rect.left() + 5, del_rect.top() + 5, del_rect.right() - 5, del_rect.bottom() - 5)
                 painter.drawLine(del_rect.right() - 5, del_rect.top() + 5, del_rect.left() + 5, del_rect.bottom() - 5)
+
+            if self.is_darkroom and not self.is_remove_mode and not self.is_trash_view:
+                eye_rect = QRect(rect.right() - 28, rect.top() + 10, 20, 20)
+                painter.setBrush(QColor(0, 0, 0, 170))
+                
+                if self.cull_mode == "pick":
+                    btn_col = "#38bdf8" if is_hidden else "#facc15"
+                    btn_char = "＋" if is_hidden else "★"
+                else:
+                    btn_col = "#ef4444" if is_hidden else "#38bdf8"
+                    btn_char = "✕" if is_hidden else "👁"
+
+                painter.setPen(QPen(QColor(btn_col), 1.2))
+                painter.drawRoundedRect(eye_rect, 4, 4)
+                painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                painter.setPen(QColor(btn_col))
+                painter.drawText(eye_rect, Qt.AlignCenter, btn_char)
 
             if self.is_darkroom and not self.is_remove_mode:
                 eye_rect = QRect(rect.right() - 28, rect.top() + 10, 20, 20)
@@ -1946,6 +2059,17 @@ class AdvancedGalleryView(QListView):
         if event.button() == Qt.LeftButton:
             idx = self.indexAt(event.pos())
             is_dir = bool(idx.data(PhotoListModel.ROLE_IS_DIR)) if idx.isValid() else False
+
+            # 废片篓模式下：点击卡片或点击右上角「↩ 恢复」按钮直接触发恢复
+            if idx.isValid() and self.is_darkroom and self.delegate.is_trash_view and not is_dir:
+                file_path = idx.data(Qt.UserRole)
+                item_rect = self.visualRect(idx)
+                rel_x = event.pos().x() - item_rect.left()
+                rel_y = event.pos().y() - item_rect.top()
+                if (rel_x >= item_rect.width() - 65 and rel_y <= 36) or (event.modifiers() & Qt.ControlModifier):
+                    self.sig_card_badge_clicked.emit(file_path, "restore_from_trash")
+                    event.accept()
+                    return
 
             if idx.isValid() and self.is_darkroom and self.delegate.is_remove_mode and not is_dir:
                 cur_row = idx.row()
@@ -2134,13 +2258,22 @@ class FilmstripListView(QListView):
         self.setWrapping(False)
         self.setResizeMode(QListView.Adjust)
         self.setUniformItemSizes(True)
-        self.setGridSize(QSize(76, 80))  # 紧凑微间距网格
+        self.setGridSize(QSize(76, 80))
         self.setMovement(QListView.Static)
         self.setSpacing(3)
-        self.setFixedHeight(86)  # 从 58px 提升到 86px 专业级高度
+        self.setFixedHeight(86)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 彻底剥夺胶卷条的键盘焦点，禁止拦截任何键盘事件
+        self.setFocusPolicy(Qt.NoFocus)
         self.setStyleSheet("QListView { background-color: rgba(10, 10, 12, 240); border-top: 1px solid #27272a; padding: 2px; outline: none; }")
+
+    def mousePressEvent(self, event: QMouseEvent):
+        super().mousePressEvent(event)
+        # 无论鼠标点哪张底片，立即把系统键盘焦点精准还给大图检视器
+        p = self.parent()
+        if p is not None:
+            p.setFocus()
 
     def wheelEvent(self, event: QWheelEvent):
         delta = event.angleDelta().y() or event.angleDelta().x()
@@ -2295,6 +2428,9 @@ class SinglePhotoViewer(QWidget):
     sig_filter_mode_toggled = Signal(bool)
     sig_photo_changed = Signal(str, int, int)
     sig_rating_requested = Signal(str, int)
+    sig_throw_trash_requested = Signal(str)
+    sig_restore_trash_requested = Signal(str)
+    sig_delete_perm_requested = Signal(str)
 
     def __init__(self, parent=None, is_darkroom=False, cull_mode="reject"):
         super().__init__(parent)
@@ -2550,7 +2686,41 @@ class SinglePhotoViewer(QWidget):
         self.btn_mark_toggle.clicked.connect(self._on_mark_toggle_clicked)
         tool_layout.addWidget(self.btn_mark_toggle)
 
-        cb_title = "显示未选照片" if self.cull_mode == "pick" else "显示废片"
+        # 丢废片篓按钮
+        self.btn_throw_trash = QPushButton("🗑️ 丢废片篓", self.tool_box)
+        self.btn_throw_trash.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #ef4444; border-radius: 3px; font-weight: 600; font-size: 11px; padding: 4px 10px; color: #ef4444; } QPushButton:hover { background-color: #7f1d1d; color: #ffffff; }")
+        self.btn_throw_trash.setToolTip("将当前照片丢进暗房废片篓 (快捷键: Backspace)")
+        self.btn_throw_trash.clicked.connect(self._on_throw_trash_clicked)
+        self.btn_throw_trash.setVisible(self.is_darkroom)
+        tool_layout.addWidget(self.btn_throw_trash)
+
+        # 废片篓大图专属：恢复与彻底删除按钮
+        self.btn_restore_from_trash = QPushButton("↩️ 恢复到暗房", self.tool_box)
+        self.btn_restore_from_trash.setStyleSheet("QPushButton { background-color: #064e3b; border: 1px solid #10b981; border-radius: 3px; font-weight: 600; font-size: 11px; padding: 4px 10px; color: #ffffff; } QPushButton:hover { background-color: #047857; }")
+        self.btn_restore_from_trash.clicked.connect(self._on_restore_trash_clicked)
+        self.btn_restore_from_trash.setVisible(False)
+        tool_layout.addWidget(self.btn_restore_from_trash)
+
+        self.btn_perm_delete_single = QPushButton("🧨 彻底删除", self.tool_box)
+        self.btn_perm_delete_single.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #ef4444; border-radius: 3px; font-weight: 600; font-size: 11px; padding: 4px 10px; color: #ef4444; } QPushButton:hover { background-color: #7f1d1d; color: #ffffff; }")
+        self.btn_perm_delete_single.clicked.connect(self._on_perm_delete_clicked)
+        self.btn_perm_delete_single.setVisible(False)
+        tool_layout.addWidget(self.btn_perm_delete_single)
+
+        # 废片篓大图专属：恢复与单张彻底删除按钮
+        self.btn_restore_from_trash = QPushButton("↩️ 恢复到暗房", self.tool_box)
+        self.btn_restore_from_trash.setStyleSheet("QPushButton { background-color: #064e3b; border: 1px solid #10b981; border-radius: 3px; font-weight: 600; font-size: 11px; padding: 4px 10px; color: #ffffff; } QPushButton:hover { background-color: #047857; }")
+        self.btn_restore_from_trash.clicked.connect(self._on_restore_trash_clicked)
+        self.btn_restore_from_trash.setVisible(False)
+        tool_layout.addWidget(self.btn_restore_from_trash)
+
+        self.btn_perm_delete_single = QPushButton("🧨 彻底删除", self.tool_box)
+        self.btn_perm_delete_single.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #ef4444; border-radius: 3px; font-weight: 600; font-size: 11px; padding: 4px 10px; color: #ef4444; } QPushButton:hover { background-color: #7f1d1d; color: #ffffff; }")
+        self.btn_perm_delete_single.clicked.connect(self._on_perm_delete_clicked)
+        self.btn_perm_delete_single.setVisible(False)
+        tool_layout.addWidget(self.btn_perm_delete_single)
+
+        cb_title = "显示未选好片 (变暗)"
         self.cb_viewer_show_unpicked = QCheckBox(cb_title, self.tool_box)
         self.cb_viewer_show_unpicked.setChecked(True)
         self.cb_viewer_show_unpicked.setStyleSheet("QCheckBox { color: #38bdf8; font-weight: bold; font-size: 11px; margin-left: 2px; }")
@@ -2578,9 +2748,16 @@ class SinglePhotoViewer(QWidget):
         self.edit_zoom.setFocusPolicy(Qt.ClickFocus)
         self.cb_viewer_show_unpicked.setFocusPolicy(Qt.NoFocus)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 页面再次切回进入时，确保所有控件重新核准坐标，杜绝隐藏进入后按钮沉底消失
+        self._relayout_overlays()
+        self.setFocus()
+
     def _relayout_overlays(self):
         w, h = self.width(), self.height()
-        # btn_back, lbl_filename, lbl_target_badge 已经托管在顶部工具栏，无需在画面内部计算坐标
+        if w <= 0 or h <= 0:
+            return
 
         if self.compare_mode:
             half = w // 2
@@ -2594,6 +2771,8 @@ class SinglePhotoViewer(QWidget):
         self.minimap.move(w - 196, 16)
 
         film_h = 86 if self.filmstrip_view.isVisible() else 0
+
+        # 定位悬浮控制栏
         self.tool_box.move(16, h - 38 - film_h)
         self.zoom_box.adjustSize()
         self.zoom_box.move(w - self.zoom_box.width() - 16, h - 38 - film_h)
@@ -2601,6 +2780,16 @@ class SinglePhotoViewer(QWidget):
 
         if self.filmstrip_view.isVisible():
             self.filmstrip_view.setGeometry(0, h - 86, w, 86)
+
+        # 核心防消失铁律：悬浮工具条的物理 Z-Order 永远置顶，绝不被胶卷条反向吞噬
+        self.tool_box.raise_()
+        self.zoom_box.raise_()
+        self.star_bar.raise_()
+        self.btn_prev.raise_()
+        self.btn_next.raise_()
+        if self.compare_mode:
+            self.btn_cmp_left_next.raise_()
+            self.btn_cmp_right_prev.raise_()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2610,10 +2799,15 @@ class SinglePhotoViewer(QWidget):
     def _on_viewer_filter_toggled(self, checked: bool):
         self.sig_filter_mode_toggled.emit(checked)
 
-    def load_context(self, index: int, photo_list: list, thumb_cache=None, is_marked: bool = False):
-        _crashlog(f"[viewer] load_context idx={index} path={photo_list[index] if 0 <= index < len(photo_list) else '?'}")
+    def load_context(self, index: int, photo_list: list, thumb_cache=None, is_marked: bool = False, is_trash_view: bool = False):
         self.photo_list = list(photo_list)
         self.current_index = index
+        self.is_trash_view_mode = is_trash_view
+        if hasattr(self, "btn_restore_from_trash"):
+            self.btn_restore_from_trash.setVisible(is_trash_view and self.is_darkroom)
+            self.btn_perm_delete_single.setVisible(is_trash_view and self.is_darkroom)
+            self.btn_throw_trash.setVisible((not is_trash_view) and self.is_darkroom)
+            self.btn_mark_toggle.setVisible(not is_trash_view)
 
         # 换目录/换上下文时退出对比模式
         self.compare_mode = False
@@ -2649,21 +2843,15 @@ class SinglePhotoViewer(QWidget):
         self.update_mark_ui(is_marked)
 
     def update_mark_ui(self, is_marked: bool):
+        k_mark = load_shortcuts()['mark']
         if self.is_darkroom:
-            if self.cull_mode == "pick":
-                if is_marked:
-                    self.btn_mark_toggle.setText(f"○ 未选好片 (按 {load_shortcuts()['mark']} 选定)")
-                    self.btn_mark_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #52525b; border-radius: 4px; font-weight: bold; padding: 4px 10px; color: #a1a1aa; } QPushButton:hover { background-color: #27272a; }")
-                else:
-                    self.btn_mark_toggle.setText(f"★ 已精选好片 (按 {load_shortcuts()['mark']} 取消)")
-                    self.btn_mark_toggle.setStyleSheet("QPushButton { background-color: #854d0e; border: 1px solid #facc15; border-radius: 4px; font-weight: bold; padding: 4px 10px; color: #ffffff; }")
+            # 无论哪种模式，只要在未选状态，统一以温和灰框标记为「○ 未选好片」
+            if is_marked:
+                self.btn_mark_toggle.setText(f"○ 未选好片 (按 {k_mark} 选入)")
+                self.btn_mark_toggle.setStyleSheet("QPushButton { background-color: #18181c; border: 1px solid #52525b; border-radius: 4px; font-weight: bold; padding: 4px 12px; color: #a1a1aa; } QPushButton:hover { background-color: #27272a; border-color: #38bdf8; color: #38bdf8; }")
             else:
-                if is_marked:
-                    self.btn_mark_toggle.setText(f"🚫 已隐藏/废片 (按 {load_shortcuts()['mark']} 恢复)")
-                    self.btn_mark_toggle.setStyleSheet("QPushButton { background-color: #7f1d1d; border: 1px solid #ef4444; border-radius: 4px; font-weight: bold; padding: 4px 10px; color: #ffffff; }")
-                else:
-                    self.btn_mark_toggle.setText(f"👁️ 正常保留 (按 {load_shortcuts()['mark']} 隐藏)")
-                    self.btn_mark_toggle.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #52525b; border-radius: 4px; font-weight: bold; padding: 4px 10px; color: #22c55e; } QPushButton:hover { background-color: #27272a; }")
+                self.btn_mark_toggle.setText(f"★ 已精选好片 (按 {k_mark} 取消)")
+                self.btn_mark_toggle.setStyleSheet("QPushButton { background-color: #854d0e; border: 1px solid #facc15; border-radius: 4px; font-weight: bold; padding: 4px 12px; color: #ffffff; } QPushButton:hover { background-color: #a16207; }")
         else:
             if is_marked:
                 self.btn_mark_toggle.setText(f"✓ 已选择照片 (按 {load_shortcuts()['mark']} 取消)")
@@ -2695,6 +2883,21 @@ class SinglePhotoViewer(QWidget):
         p = self.get_active_path()
         if p:
             self.sig_toggle_mark_requested.emit(p)
+
+    def _on_throw_trash_clicked(self):
+        p = self.get_active_path()
+        if p and self.is_darkroom:
+            self.sig_throw_trash_requested.emit(p)
+
+    def _on_restore_trash_clicked(self):
+        p = self.get_active_path()
+        if p and self.is_darkroom:
+            self.sig_restore_trash_requested.emit(p)
+
+    def _on_perm_delete_clicked(self):
+        p = self.get_active_path()
+        if p and self.is_darkroom:
+            self.sig_delete_perm_requested.emit(p)
 
     def _load_current_photo(self):
         if not (0 <= self.current_index < len(self.photo_list)):
@@ -2744,7 +2947,7 @@ class SinglePhotoViewer(QWidget):
             idx = self.filmstrip_model.index(self.current_index, 0)
             self.filmstrip_view.setCurrentIndex(idx)
             if self.filmstrip_view.isVisible():
-                self.filmstrip_view.scrollTo(idx, QAbstractItemView.PositionAtCenter)
+                self.filmstrip_view.scrollTo(idx, QAbstractItemView.EnsureVisible)
 
         # 【切图视口继承】：如果正处于特写模式，下一张照片瞬间自动对准该图双眼！
         if self.is_eye_zoom_mode:
@@ -3281,7 +3484,7 @@ class SinglePhotoViewer(QWidget):
             if self.filmstrip_model.rowCount() > 0:
                 idx = self.filmstrip_model.index(self.current_index, 0)
                 self.filmstrip_view.setCurrentIndex(idx)
-                self.filmstrip_view.scrollTo(idx, QAbstractItemView.PositionAtCenter)
+                self.filmstrip_view.scrollTo(idx, QAbstractItemView.EnsureVisible)
 
     def _toggle_fullscreen(self):
         self.sig_toggle_cinema_fullscreen.emit()
@@ -3304,6 +3507,9 @@ class SinglePhotoViewer(QWidget):
         self.update()
 
     def _on_filmstrip_item_clicked(self, index: QModelIndex):
+        self.setFocus()  # 确保点击底片后焦点立刻回到检视器
+        if not index.isValid():
+            return
         if not index.isValid():
             return
         if self.compare_mode:
@@ -3965,6 +4171,11 @@ class SinglePhotoViewer(QWidget):
         elif key == k_next:
             self.next_image()
             event.accept()
+        # 暗房模式下按下 Backspace，一键丢入废片篓
+        elif key == Qt.Key_Backspace and self.is_darkroom:
+            self._on_throw_trash_clicked()
+            event.accept()
+            return
         elif key in (k_mark, Qt.Key_X, Qt.Key_Delete):
             self._on_mark_toggle_clicked()
             event.accept()
@@ -4534,13 +4745,37 @@ class DarkroomExportWorker(QThread):
         skipped_jpg_all = 0
         skipped_jpg2 = 0
 
-        # 预先建立 RAW 源目录索引池，供分辨率过低时自动反向溯源并唤醒满血反马赛克重解
+        # 预先建立 RAW 源目录索引池（全盘递归扫描 + 多源聚合 + 多重键命中）
         raw_index = {}
-        if self.raw_src_dir.exists() and self.raw_src_dir.is_dir():
-            for f in self.raw_src_dir.iterdir():
-                if f.is_file() and f.suffix.lower() in RAW_IMAGE_EXTS:
-                    key = self.normalize_stem(f.stem)
-                    raw_index[key] = f
+        scanned_dirs = set()
+        
+        # 收集所有可能的源目录：工作根目录 + 所有照片所在的实际物理目录
+        candidate_dirs = [self.raw_src_dir]
+        for p_str in self.all_photos:
+            p_parent = Path(p_str).parent
+            if p_parent not in candidate_dirs:
+                candidate_dirs.append(p_parent)
+
+        for c_dir in candidate_dirs:
+            if not c_dir or not c_dir.exists() or not c_dir.is_dir():
+                continue
+            # 递归 walk 扫穿全部子目录（如 RAW/、CR3/、DCIM 等），排除目标输出目录防死循环
+            for root, dirs, files in os.walk(c_dir):
+                root_path = Path(root)
+                if self.dest_dir in root_path.parents or root_path == self.dest_dir:
+                    continue
+                if root in scanned_dirs:
+                    continue
+                scanned_dirs.add(root)
+
+                for fn in files:
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in RAW_IMAGE_EXTS:
+                        f_path = root_path / fn
+                        stem = f_path.stem
+                        # 多维索引：原名小写、归一化去前缀数字，双重保险
+                        raw_index[stem.lower()] = f_path
+                        raw_index[self.normalize_stem(stem)] = f_path
 
         def _deliver_jpg(src: Path, dst_dir: Path, cur: int, total: int, tag: str) -> bool:
             raw_target_path = None
@@ -4621,7 +4856,18 @@ class DarkroomExportWorker(QThread):
                 if is_raw_file(src):
                     raw_file = src
                 else:
-                    raw_file = raw_index.get(self.normalize_stem(src.stem))
+                    # 1. 优先就地同级探测（同目录下存在同名 .cr3 / .CR3 / .arw 等直接秒杀命中）
+                    raw_file = None
+                    for raw_ext in ('.cr3', '.CR3', '.arw', '.ARW', '.nef', '.NEF', '.dng', '.DNG'):
+                        sibling = src.with_suffix(raw_ext)
+                        if sibling.exists():
+                            raw_file = sibling
+                            break
+                    # 2. 同级没有，走全局递归索引池多重碰撞匹配
+                    if not raw_file:
+                        stem_lower = src.stem.lower()
+                        stem_norm = self.normalize_stem(src.stem)
+                        raw_file = raw_index.get(stem_lower) or raw_index.get(stem_norm)
 
                 if raw_file:
                     self.sig_progress.emit(cur_step, total_steps, f"匹配生肉 RAW: {raw_file.name}")
@@ -5464,7 +5710,7 @@ class AlbumPageWidget(QWidget):
             task.signals.task_done.connect(self._on_single_task_done)
             task.signals.meta_loaded.connect(self._on_rating_loaded)
             task.signals.provisional_used.connect(self._on_provisional_used)
-            task.signals.task_done.connect(lambda p, t=task: self._live_thumb_tasks.discard(t))
+            task.signals.task_done.connect(lambda p, t=task: QTimer.singleShot(200, lambda: self._live_thumb_tasks.discard(t)))
             thread_pool.start(task)
 
     def _on_provisional_used(self, file_path: str):
@@ -5480,7 +5726,7 @@ class AlbumPageWidget(QWidget):
             task.setAutoDelete(False)  # 同预热：防 C++/GC 双重析构竞态
             self._live_thumb_tasks.add(task)
             task.signals.loaded.connect(self._on_single_thumb_cached)
-            task.signals.task_done.connect(lambda p, t=task: self._live_thumb_tasks.discard(t))
+            task.signals.task_done.connect(lambda p, t=task: QTimer.singleShot(200, lambda: self._live_thumb_tasks.discard(t)))
             self._upgrade_pool.start(task)
 
     def _on_single_thumb_cached(self, file_path: str, qimage: QImage):
@@ -5650,7 +5896,9 @@ class DarkroomPageWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.all_darkroom_photos = []
+        self.trash_photos = []          # 核心：暗房专属废片篓池
         self.visible_photos = []
+        self.is_viewing_trash = False   # 是否正处于废片篓视图
         self.model = PhotoListModel()
         self.p02_source_dir = ""
         self.export_worker = None
@@ -5675,6 +5923,9 @@ class DarkroomPageWidget(QWidget):
         self.photo_viewer.sig_filter_mode_toggled.connect(self._on_viewer_filter_mode_toggled)
         self.photo_viewer.sig_photo_changed.connect(self.sig_selection_changed)
         self.photo_viewer.sig_rating_requested.connect(self._on_viewer_rating_requested)
+        self.photo_viewer.sig_restore_trash_requested.connect(self._on_viewer_restore_trash)
+        self.photo_viewer.sig_delete_perm_requested.connect(self._on_viewer_delete_perm)
+        self.photo_viewer.sig_throw_trash_requested.connect(self._on_viewer_throw_trash)
 
         # 2. 暗房独立全宽顶部面板（支持画廊/大图双模式平滑切换）
         self.header_widget = QFrame()
@@ -5716,12 +5967,25 @@ class DarkroomPageWidget(QWidget):
         self.btn_back_to_album.clicked.connect(self.sig_return_to_gallery.emit)
         b_layout.addWidget(self.btn_back_to_album)
 
-        self.btn_remove_mode = QPushButton("🗑️ 移出照片")
+        self.btn_remove_mode = QPushButton("🗑️ 批量移入废片篓")
         self.btn_remove_mode.setStyleSheet("font-weight: bold; padding: 4px 10px;")
         self.btn_remove_mode.clicked.connect(self._toggle_remove_mode)
         b_layout.addWidget(self.btn_remove_mode)
 
-        self.btn_clear_darkroom = QPushButton("🧨 一键清空")
+        # 核心入口：废片篓切换按钮
+        self.btn_toggle_trash = QPushButton("🗑️ 废片篓 (0)")
+        self.btn_toggle_trash.setStyleSheet("QPushButton { background-color: #18181c; border: 1px solid #3f3f46; border-radius: 4px; font-weight: bold; padding: 4px 12px; color: #a1a1aa; } QPushButton:hover { border-color: #ef4444; color: #f87171; }")
+        self.btn_toggle_trash.clicked.connect(self._toggle_trash_view)
+        b_layout.addWidget(self.btn_toggle_trash)
+
+        # 废片篓视图专属动作按钮
+        self.btn_restore_all_trash = QPushButton("↩️ 全部恢复到暗房")
+        self.btn_restore_all_trash.setStyleSheet("QPushButton { background-color: #064e3b; border: 1px solid #10b981; border-radius: 4px; font-weight: bold; padding: 4px 12px; color: #ffffff; } QPushButton:hover { background-color: #047857; }")
+        self.btn_restore_all_trash.setVisible(False)
+        self.btn_restore_all_trash.clicked.connect(self._restore_all_from_trash)
+        b_layout.addWidget(self.btn_restore_all_trash)
+
+        self.btn_clear_darkroom = QPushButton("🧨 彻底清空废片篓")
         self.btn_clear_darkroom.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #ef4444; border-radius: 4px; font-weight: bold; padding: 4px 10px; color: #ef4444; } QPushButton:hover { background-color: #7f1d1d; color: #ffffff; }")
         self.btn_clear_darkroom.setVisible(False)
         self.btn_clear_darkroom.clicked.connect(self._on_clear_darkroom)
@@ -5844,26 +6108,189 @@ class DarkroomPageWidget(QWidget):
 
         self._refresh_darkroom_view()
 
+    def _toggle_trash_view(self):
+        """在暗房选片区与废片篓回收站之间无缝切换"""
+        self.is_viewing_trash = not self.is_viewing_trash
+        self.gallery.delegate.is_trash_view = self.is_viewing_trash
+
+        if self.is_viewing_trash:
+            self.btn_back_to_album.setVisible(False)
+            self.btn_remove_mode.setVisible(False)
+            self.cb_show_hidden.setVisible(False)
+            self.btn_restore_all_trash.setVisible(len(self.trash_photos) > 0)
+            self.btn_clear_darkroom.setVisible(len(self.trash_photos) > 0)
+            self.btn_clear_darkroom.setText("🧨 彻底清空废片篓")
+            self.btn_toggle_trash.setText("🧪 返回暗房选片区")
+            self.btn_toggle_trash.setStyleSheet("QPushButton { background-color: #0284c7; border: 1px solid #38bdf8; border-radius: 4px; font-weight: bold; padding: 4px 12px; color: #ffffff; }")
+            self.btn_export.setEnabled(False)
+        else:
+            self.btn_back_to_album.setVisible(True)
+            self.btn_remove_mode.setVisible(True)
+            self.cb_show_hidden.setVisible(True)
+            self.btn_restore_all_trash.setVisible(False)
+            self.btn_clear_darkroom.setVisible(False)
+            self.btn_toggle_trash.setStyleSheet("QPushButton { background-color: #18181c; border: 1px solid #3f3f46; border-radius: 4px; font-weight: bold; padding: 4px 12px; color: #a1a1aa; } QPushButton:hover { border-color: #ef4444; color: #f87171; }")
+            self.btn_export.setEnabled(True)
+
+        self._refresh_darkroom_view()
+
     def _toggle_remove_mode(self):
         delegate = self.gallery.delegate
         delegate.is_remove_mode = not delegate.is_remove_mode
         if delegate.is_remove_mode:
             delegate.remove_set.clear()
-            self.btn_remove_mode.setText("✕ 完成移出")
+            self.btn_remove_mode.setText("✕ 确认丢入废片篓")
             self.btn_remove_mode.setStyleSheet("background-color: #7f1d1d; color: white; font-weight: bold; padding: 4px 10px;")
-            self.btn_clear_darkroom.setVisible(len(self.all_darkroom_photos) > 0)
         else:
-            self.btn_clear_darkroom.setVisible(False)
-            self.btn_remove_mode.setText("🗑️ 移出照片")
+            self.btn_remove_mode.setText("🗑️ 批量移入废片篓")
             self.btn_remove_mode.setStyleSheet("font-weight: bold; padding: 4px 10px;")
             if delegate.remove_set:
-                doomed = set(delegate.remove_set)
-                self.all_darkroom_photos = [p for p in self.all_darkroom_photos if p not in doomed]
-                delegate.hidden_set -= doomed
+                doomed = list(delegate.remove_set)
+                self._throw_to_trash(doomed)
                 delegate.remove_set.clear()
                 self.gallery.last_clicked_row = -1
-            self._refresh_darkroom_view()
         self.gallery.viewport().update()
+
+    def _throw_to_trash(self, photo_paths: list):
+        """将照片移出暗房，收入废片篓"""
+        doomed_set = set(photo_paths)
+        self.all_darkroom_photos = [p for p in self.all_darkroom_photos if p not in doomed_set]
+        self.gallery.delegate.hidden_set -= doomed_set
+        for p in photo_paths:
+            if p not in self.trash_photos:
+                self.trash_photos.append(p)
+        self._refresh_darkroom_view()
+
+    def _restore_from_trash(self, photo_paths: list):
+        """从废片篓恢复照片回暗房（核心：恢复后状态严格为未选上，进入待审池）"""
+        restore_set = set(photo_paths)
+        self.trash_photos = [p for p in self.trash_photos if p not in restore_set]
+        for p in photo_paths:
+            if p not in self.all_darkroom_photos:
+                self.all_darkroom_photos.append(p)
+            # 铁律：恢复回来的照片严格归入未选中/压暗状态，绝不直接算成好片
+            self.gallery.delegate.hidden_set.add(p)
+        self._refresh_darkroom_view()
+
+    def _delete_perm_from_trash(self, photo_paths: list):
+        """在废片篓内彻底移除（仅移出本软件暗房记录，绝不删物理硬盘原片）"""
+        del_set = set(photo_paths)
+        self.trash_photos = [p for p in self.trash_photos if p not in del_set]
+        self._refresh_darkroom_view()
+
+    def _restore_all_from_trash(self):
+        """一键把废片篓所有照片全部恢复"""
+        if not self.trash_photos:
+            return
+        self._restore_from_trash(list(self.trash_photos))
+        self._toggle_trash_view()
+
+    def _on_viewer_throw_trash(self, file_path: str):
+        """大图模式下一键丢进废片篓，并无缝切到下一张"""
+        if file_path in self.all_darkroom_photos:
+            cur_idx = self.photo_viewer.current_index
+            self._throw_to_trash([file_path])
+            # 刷新大图上下文，无缝跳到下一张
+            active_list = list(self.all_darkroom_photos)
+            if active_list:
+                next_idx = min(cur_idx, len(active_list) - 1)
+                next_path = active_list[next_idx]
+                is_marked = next_path in self.gallery.delegate.hidden_set
+                self.photo_viewer.load_context(next_idx, active_list, thumb_cache=self.gallery.delegate.thumb_cache, is_marked=is_marked)
+            else:
+                self.photo_viewer._on_back_clicked()
+
+    def _on_viewer_restore_trash(self, file_path: str):
+        """大图模式下直接把废片恢复到暗房（未选中状态），并无缝滑到下一张废片"""
+        cur_idx = self.photo_viewer.current_index
+        self._restore_from_trash([file_path])
+        active_list = list(self.trash_photos)
+        if active_list:
+            next_idx = min(cur_idx, len(active_list) - 1)
+            self.photo_viewer.load_context(next_idx, active_list, thumb_cache=self.gallery.delegate.thumb_cache, is_trash_view=True)
+        else:
+            self.photo_viewer._on_back_clicked()
+
+    def _on_viewer_delete_perm(self, file_path: str):
+        """大图模式下彻底粉碎移除废片记录，并滑到下一张"""
+        cur_idx = self.photo_viewer.current_index
+        self._delete_perm_from_trash([file_path])
+        active_list = list(self.trash_photos)
+        if active_list:
+            next_idx = min(cur_idx, len(active_list) - 1)
+            self.photo_viewer.load_context(next_idx, active_list, thumb_cache=self.gallery.delegate.thumb_cache, is_trash_view=True)
+        else:
+            self.photo_viewer._on_back_clicked()
+
+    def _on_clear_darkroom(self):
+        if not self.trash_photos:
+            return
+        total = len(self.trash_photos)
+        ret = QMessageBox.question(
+            self, "确认清空废片篓",
+            f"将永久清空暗房废片篓中的全部 {total} 张照片记录（不影响硬盘上的原始文件）。\n\n清空后将无法从废片篓恢复，确认清空？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if ret == QMessageBox.Yes:
+            self.trash_photos.clear()
+            self._refresh_darkroom_view()
+
+    def _on_badge_clicked(self, file_path: str, action: str):
+        if action == "restore_from_trash":
+            self._restore_from_trash([file_path])
+        elif action == "delete_perm":
+            self._delete_perm_from_trash([file_path])
+        elif action == "remove":
+            self._throw_to_trash([file_path])
+
+    def _on_toggle_show_hidden(self):
+        self._refresh_darkroom_view()
+
+    def _refresh_darkroom_view(self):
+        delegate = self.gallery.delegate
+        trash_cnt = len(self.trash_photos)
+        
+        # 实时刷新废片篓徽标统计与高亮颜色
+        if not self.is_viewing_trash:
+            self.btn_toggle_trash.setText(f"🗑️ 废片篓 ({trash_cnt})")
+            if trash_cnt > 0:
+                self.btn_toggle_trash.setStyleSheet("QPushButton { background-color: #27272a; border: 1px solid #ef4444; border-radius: 4px; font-weight: bold; padding: 4px 12px; color: #f87171; } QPushButton:hover { background-color: #7f1d1d; color: #ffffff; }")
+            else:
+                self.btn_toggle_trash.setStyleSheet("QPushButton { background-color: #18181c; border: 1px solid #3f3f46; border-radius: 4px; font-weight: bold; padding: 4px 12px; color: #a1a1aa; } QPushButton:hover { border-color: #ef4444; color: #f87171; }")
+
+        # 核心：根据当前是选片区还是废片篓，渲染对应列表
+        if self.is_viewing_trash:
+            self.visible_photos = list(self.trash_photos)
+            self.model.set_photos(self.visible_photos)
+            self.lbl_dark_stats.setText(f"🗑️ 暗房废片篓: 共 {trash_cnt} 张废片 (点击「↩ 恢复」可捞回暗房)")
+            self.btn_restore_all_trash.setVisible(trash_cnt > 0)
+            self.btn_clear_darkroom.setVisible(trash_cnt > 0)
+        else:
+            show_hidden = self.cb_show_hidden.isChecked()
+            if show_hidden:
+                self.visible_photos = list(self.all_darkroom_photos)
+            else:
+                self.visible_photos = [p for p in self.all_darkroom_photos if p not in delegate.hidden_set]
+
+            self.model.set_photos(self.visible_photos)
+            total_count = len(self.all_darkroom_photos)
+            hidden_count = len(delegate.hidden_set)
+            active_count = total_count - hidden_count
+            jpg_cnt = sum(1 for p in self.all_darkroom_photos if not is_raw_file(p))
+            raw_cnt = sum(1 for p in self.all_darkroom_photos if is_raw_file(p))
+            fmt_detail = f"[{jpg_cnt} JPG, {raw_cnt} RAW]" if (jpg_cnt and raw_cnt) else (f"[{raw_cnt} RAW]" if raw_cnt else f"[{jpg_cnt} JPG]")
+
+            if self.cull_mode == "pick":
+                self.lbl_dark_stats.setText(f"暗房: {total_count} 张 {fmt_detail} (★已选 {active_count} | 待挑选 {hidden_count}) | 🗑️ 废片篓: {trash_cnt} 张")
+            else:
+                self.lbl_dark_stats.setText(f"暗房: {total_count} 张 {fmt_detail} (保留 {active_count} | 隐藏 {hidden_count}) | 🗑️ 废片篓: {trash_cnt} 张")
+
+            if delegate.is_remove_mode:
+                cnt = len(delegate.remove_set)
+                self.btn_remove_mode.setText(f"✕ 确认丢入废片篓 ({cnt})" if cnt > 0 else "✕ 确认丢入废片篓")
+
+        self.gallery.viewport().update()
+        self._save_session()
 
     def _clear_darkroom_all(self):
         self.all_darkroom_photos.clear()
@@ -5884,19 +6311,6 @@ class DarkroomPageWidget(QWidget):
         if self.gallery.delegate.is_remove_mode:
             self._toggle_remove_mode()
         self._refresh_darkroom_view()
-
-    def _on_clear_darkroom(self):
-        total = len(self.all_darkroom_photos)
-        if total == 0:
-            return
-        ret = QMessageBox.question(
-            self, "确认清空暗房",
-            f"即将把暗房中全部 {total} 张照片一次性移出选片列表，并同步清空暗房缩略图缓存。\n\n仅移出暗房，不会删除硬盘上的原图文件。\n\n确认清空吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if ret != QMessageBox.Yes:
-            return
-        self._clear_darkroom_all()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -5927,49 +6341,10 @@ class DarkroomPageWidget(QWidget):
                     self._clear_darkroom_all()
         return super().eventFilter(obj, event)
 
-    def _on_badge_clicked(self, file_path: str, action: str):
-        if action == "remove":
-            if file_path in self.all_darkroom_photos:
-                self.all_darkroom_photos.remove(file_path)
-            if file_path in self.gallery.delegate.hidden_set:
-                self.gallery.delegate.hidden_set.remove(file_path)
-            self._refresh_darkroom_view()
-
-    def _on_toggle_show_hidden(self):
-        self._refresh_darkroom_view()
-
-    def _refresh_darkroom_view(self):
-        delegate = self.gallery.delegate
-        show_hidden = self.cb_show_hidden.isChecked()
-
-        if show_hidden:
-            self.visible_photos = list(self.all_darkroom_photos)
-        else:
-            self.visible_photos = [p for p in self.all_darkroom_photos if p not in delegate.hidden_set]
-
-        self.model.set_photos(self.visible_photos)
-        total_count = len(self.all_darkroom_photos)
-        hidden_count = len(delegate.hidden_set)
-        active_count = total_count - hidden_count
-        jpg_cnt = sum(1 for p in self.all_darkroom_photos if not is_raw_file(p))
-        raw_cnt = sum(1 for p in self.all_darkroom_photos if is_raw_file(p))
-        fmt_detail = f"[{jpg_cnt} JPG, {raw_cnt} RAW]" if (jpg_cnt and raw_cnt) else (f"[{raw_cnt} RAW]" if raw_cnt else f"[{jpg_cnt} JPG]")
-
-        if self.cull_mode == "pick":
-            self.lbl_dark_stats.setText(f"暗房: {total_count} 张 {fmt_detail} (★已选好片 {active_count} | 待挑选 {hidden_count})")
-        else:
-            self.lbl_dark_stats.setText(f"暗房: {total_count} 张 {fmt_detail} (活跃保留 {active_count} | 剔除废片 {hidden_count})")
-
-        if delegate.is_remove_mode:
-            cnt = len(delegate.remove_set)
-            self.btn_remove_mode.setText(f"✕ 完成移出 ({cnt})" if cnt > 0 else "✕ 完成移出")
-
-        self.gallery.viewport().update()
-        self._save_session()
-
     def _save_session(self):
         settings = QSettings("AnicropGeeks", "AnicropStudio")
         settings.setValue("darkroom_photos", self.all_darkroom_photos)
+        settings.setValue("darkroom_trash", self.trash_photos)  # 记忆废片篓
         settings.setValue("darkroom_hidden", list(self.gallery.delegate.hidden_set))
         settings.setValue("darkroom_source_dir", self.p02_source_dir)
 
@@ -5984,6 +6359,8 @@ class DarkroomPageWidget(QWidget):
             return
 
         self.all_darkroom_photos = photos
+        self.trash_photos = settings.value("darkroom_trash", []) or []
+        self.trash_photos = [p for p in self.trash_photos if Path(p).exists()]
         self.p02_source_dir = settings.value("darkroom_source_dir", "")
         keep = set(photos)
         self.gallery.delegate.hidden_set = {p for p in hidden if p in keep}
@@ -6004,7 +6381,7 @@ class DarkroomPageWidget(QWidget):
             self._restore_tasks = getattr(self, "_restore_tasks", set())
             self._restore_tasks.add(task)
             task.signals.loaded.connect(self._on_restore_thumb)
-            task.signals.task_done.connect(lambda p, t=task: self._restore_tasks.discard(t))
+            task.signals.task_done.connect(lambda p, t=task: QTimer.singleShot(200, lambda: self._restore_tasks.discard(t)))
             pool.start(task)
 
     def _on_restore_thumb(self, file_path: str, qimage: QImage):
@@ -6041,6 +6418,23 @@ class DarkroomPageWidget(QWidget):
         row = index.row()
         file_path = self.visible_photos[row]
         delegate = self.gallery.delegate
+
+        # 核心：如果在废片篓视图，双击直接带入废片池进行大图复审！
+        if self.is_viewing_trash:
+            active_list = list(self.trash_photos)
+            cur_idx = active_list.index(file_path) if file_path in active_list else 0
+            self.photo_viewer.load_context(
+                cur_idx, active_list,
+                thumb_cache=delegate.thumb_cache,
+                is_marked=False,
+                is_trash_view=True
+            )
+            self.gallery_bar.setVisible(False)
+            self.viewer_bar.setVisible(True)
+            self.stack.setCurrentIndex(1)
+            self.sig_viewer_active.emit(True)
+            self.photo_viewer.setFocus()
+            return
 
         show_unpicked_in_viewer = self.photo_viewer.cb_viewer_show_unpicked.isChecked()
 
@@ -6184,6 +6578,13 @@ class DarkroomPageWidget(QWidget):
 
     def _on_export_finished(self, res: dict):
         self.progress_dlg.close()
+        # 自动将输出的 CR3/RAW 目录注入给隔空投送站，免去手动选目录
+        win = self.window()
+        if hasattr(win, "page_airlink"):
+            cr3_dir = Path(res.get("dest_dir", "")) / res.get("name_raw", "cr3")
+            task_name = Path(res.get("dest_dir", "")).name
+            win.page_airlink.set_export_context(str(cr3_dir), task_name)
+
         dlg = ExportSuccessDialog(res, self)
         dlg.exec()
 

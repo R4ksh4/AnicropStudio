@@ -1,3 +1,4 @@
+from airlink_ui import AirLinkPageWidget
 from watermark_ui import WatermarkPageWidget
 from boot_flash import BootFlash
 import sys
@@ -1230,14 +1231,19 @@ class MainWindow(QMainWindow):
         self.btn_tab_darkroom.clicked.connect(lambda: self._switch_tab(1))
         top_nav_layout.addWidget(self.btn_tab_darkroom)
 
+        self.btn_tab_airlink = QPushButton("📡 局域极速投送")
+        self.btn_tab_airlink.setProperty("class", "NavTab")
+        self.btn_tab_airlink.clicked.connect(lambda: self._switch_tab(2))
+        top_nav_layout.addWidget(self.btn_tab_airlink)
+
         self.btn_tab_watermark = QPushButton("🏷️ 参数画框水印")
         self.btn_tab_watermark.setProperty("class", "NavTab")
-        self.btn_tab_watermark.clicked.connect(lambda: self._switch_tab(2))
+        self.btn_tab_watermark.clicked.connect(lambda: self._switch_tab(3))
         top_nav_layout.addWidget(self.btn_tab_watermark)
 
         self.btn_tab_settings = QPushButton("⚙️ 系统偏好设置")
         self.btn_tab_settings.setProperty("class", "NavTab")
-        self.btn_tab_settings.clicked.connect(lambda: self._switch_tab(3))
+        self.btn_tab_settings.clicked.connect(lambda: self._switch_tab(4))
         top_nav_layout.addWidget(self.btn_tab_settings)
 
         top_nav_layout.addStretch()
@@ -1360,11 +1366,15 @@ class MainWindow(QMainWindow):
         self.page_darkroom.sig_return_to_gallery.connect(lambda: self._switch_tab(0))
         self.stack.addWidget(self.page_darkroom)
 
-        # Page 2: 参数画框水印工作台 (独立模块)
+        # Page 2: 局域网极速投送工作台 (独立模块)
+        self.page_airlink = AirLinkPageWidget()
+        self.stack.addWidget(self.page_airlink)
+
+        # Page 3: 参数画框水印工作台 (独立模块)
         self.page_watermark = WatermarkPageWidget()
         self.stack.addWidget(self.page_watermark)
 
-        # Page 3: 系统偏好设置
+        # Page 4: 系统偏好设置
         self.page_settings = SettingsPageWidget()
         self.page_settings.sig_default_path_changed.connect(self._on_default_path_updated)
         self.stack.addWidget(self.page_settings)
@@ -1422,14 +1432,28 @@ class MainWindow(QMainWindow):
         else:
             self.toolbar_stack.setVisible(False)
 
-        tabs = [self.btn_tab_album, self.btn_tab_darkroom, self.btn_tab_watermark, self.btn_tab_settings]
+        # 5 个按钮严格与 0~4 索引一一对应
+        tabs = [
+            self.btn_tab_album,
+            self.btn_tab_darkroom,
+            self.btn_tab_airlink,
+            self.btn_tab_watermark,
+            self.btn_tab_settings
+        ]
         for i, b in enumerate(tabs):
             b.setProperty("class", "NavTab NavTabActive" if i == index else "NavTab")
             b.style().polish(b)
 
         self.exif_group.setVisible(index in (0, 1))
 
-        title_map = {0: "🖼️ 漫展画廊初筛", 1: "🧪 极客暗房工坊", 2: "🏷️ 参数画框工作台", 3: "⚙️ 系统全局偏好"}
+        # 侧栏标题字典严格对齐
+        title_map = {
+            0: "🖼️ 漫展画廊初筛",
+            1: "🧪 极客暗房工坊",
+            2: "📡 局域极速投送",
+            3: "🏷️ 参数画框工作台",
+            4: "⚙️ 系统全局偏好"
+        }
         self.rail_title.setText(title_map.get(index, "📌 空间看板"))
         
     def _on_photo_selected(self, file_path: str, idx: int, total: int):
