@@ -24,7 +24,7 @@ def main():
         import ctypes
         myappid = 'anicropgeeks.anicropstudio.desktop.beta1'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--ignore-certificate-errors --disable-gpu-shader-disk-cache"
     app = QApplication(sys.argv)
     app.setApplicationName("AnicropStudio")
     app.setOrganizationName("AnicropGeeks")
