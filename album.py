@@ -856,7 +856,7 @@ def _fill_exif_from_raw(res: dict, file_path: str):
         pass
 
 def parse_photo_exif(file_path: str) -> dict:
-    """EXIF + XMP 双通道高保真参数提取器 (深度兼容像素蛋糕/Lightroom/PS导出图)"""
+    """EXIF + XMP 双通道高保真参数提取器 (深度适配尼康/佳能/索尼及 Lightroom/蛋糕导出图)"""
     res = {
         "camera": "未知机身",
         "lens": "未知镜头",
@@ -884,21 +884,33 @@ def parse_photo_exif(file_path: str) -> dict:
             res["dimensions"] = f"{sz.width()} × {sz.height()}"
 
         with open(file_path, 'rb') as f:
-            header_data = f.read(524288)  # 读前 512KB，确保吃下全部元数据
+            header_data = f.read(524288)  # 读前 512KB
 
         if len(header_data) < 4 or header_data[:2] != b'\xFF\xD8':
             if is_raw_file(file_path):
                 _fill_exif_from_raw(res, file_path)
             return res
 
-        # ---------------- 阶段 1: 扫描全部 APP1 段，提取标准 Exif TIFF ----------------
+        # 辅助解析器：安全提取 TIFF 字符串（兼容 <=4 字节内联与外部偏移）
+        def _read_tiff_str(tiff_b, en, count, val_b):
+            if count <= 0: return ""
+            try:
+                if count <= 4:
+                    raw = val_b[:count]
+                else:
+                    off = struct.unpack(en + 'I', val_b)[0]
+                    raw = tiff_b[off : off + count] if off + count <= len(tiff_b) else tiff_b[off:]
+                return raw.split(b'\x00')[0].decode('utf-8', errors='ignore').strip()
+            except Exception:
+                return ""
+
+        # ---------------- 阶段 1: 扫描 APP1 EXIF TIFF ----------------
         idx = 2
+        make_str, model_str = "", ""
         while idx < len(header_data) - 4:
-            if header_data[idx] != 0xFF:
-                break
+            if header_data[idx] != 0xFF: break
             marker = header_data[idx + 1]
-            if marker in (0xD9, 0xDA):
-                break
+            if marker in (0xD9, 0xDA): break
             length = int.from_bytes(header_data[idx + 2:idx + 4], 'big')
             seg_end = idx + 2 + length
             if marker == 0xE1:
@@ -912,22 +924,27 @@ def parse_photo_exif(file_path: str) -> dict:
                             ifd0_offset = struct.unpack(endian + 'I', tiff[4:8])[0]
                             exif_sub_offset = None
 
+                            # 1. 扫描 IFD0 (主相机品牌、型号、时间)
                             if ifd0_offset + 2 <= len(tiff):
                                 num_entries = struct.unpack(endian + 'H', tiff[ifd0_offset : ifd0_offset + 2])[0]
-                                for i in range(min(num_entries, 100)):
+                                for i in range(min(num_entries, 120)):
                                     ep = ifd0_offset + 2 + i * 12
                                     if ep + 12 > len(tiff): break
                                     tag, ftype, count = struct.unpack(endian + 'HHI', tiff[ep : ep + 8])
                                     val_bytes = tiff[ep + 8 : ep + 12]
 
-                                    if tag == 0x0110:
-                                        str_offset = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if str_offset < len(tiff):
-                                            raw_str = tiff[str_offset : str_offset + count].split(b'\x00')[0]
-                                            res["camera"] = raw_str.decode('utf-8', errors='ignore').strip()
+                                    if tag == 0x010F:  # Make
+                                        make_str = _read_tiff_str(tiff, endian, count, val_bytes)
+                                    elif tag == 0x0110:  # Model
+                                        model_str = _read_tiff_str(tiff, endian, count, val_bytes)
+                                    elif tag == 0x0132 and res["date"] == "--":  # DateTime
+                                        raw_dt = _read_tiff_str(tiff, endian, count, val_bytes)
+                                        if len(raw_dt) >= 10:
+                                            res["date"] = raw_dt[:10].replace(":", ".") + raw_dt[10:16]
                                     elif tag == 0x8769:
                                         exif_sub_offset = struct.unpack(endian + 'I', val_bytes)[0]
 
+                            # 2. 扫描 ExifIFD (快门、光圈、ISO、焦距、EV、镜头、精确拍摄时间)
                             if exif_sub_offset and exif_sub_offset + 2 <= len(tiff):
                                 num_sub = struct.unpack(endian + 'H', tiff[exif_sub_offset : exif_sub_offset + 2])[0]
                                 for i in range(min(num_sub, 200)):
@@ -949,7 +966,7 @@ def parse_photo_exif(file_path: str) -> dict:
                                             if den != 0:
                                                 res["shutter"] = f"{num/den:.1f}s" if num >= den else f"1/{round(den/num)}s"
 
-                                    elif tag in (0x8827, 0x8833):  # ISO (支持 SHORT 或 LONG)
+                                    elif tag in (0x8827, 0x8833):  # ISO
                                         iso_val = struct.unpack(endian + ('I' if ftype == 4 else 'H'), val_bytes[:4 if ftype == 4 else 2])[0]
                                         if iso_val > 0: res["iso"] = f"ISO {iso_val}"
 
@@ -959,48 +976,81 @@ def parse_photo_exif(file_path: str) -> dict:
                                             num, den = struct.unpack(endian + 'II', tiff[r_off : r_off + 8])
                                             if den != 0: res["focal"] = f"{num/den:.0f}mm"
 
-                                    elif tag == 0xA434 and ftype == 2:  # 镜头
-                                        str_offset = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if str_offset < len(tiff):
-                                            raw_str = tiff[str_offset : str_offset + count].split(b'\x00')[0]
-                                            res["lens"] = raw_str.decode('utf-8', errors='ignore').strip()
+                                    elif tag == 0x9204:  # 曝光补偿 (EV)
+                                        r_off = struct.unpack(endian + 'I', val_bytes)[0]
+                                        if r_off + 8 <= len(tiff):
+                                            num, den = struct.unpack(endian + 'ii', tiff[r_off : r_off + 8])
+                                            if den != 0:
+                                                ev_val = num / float(den)
+                                                res["ev"] = f"{ev_val:+.1f} EV" if abs(ev_val) > 0.01 else "0.0 EV"
 
-                                    elif tag == 0x9003 and ftype == 2:  # 拍摄时间
-                                        str_offset = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if str_offset < len(tiff):
-                                            raw_str = tiff[str_offset : str_offset + count].split(b'\x00')[0]
-                                            dt_str = raw_str.decode('utf-8', errors='ignore').strip()
-                                            if len(dt_str) >= 10:
-                                                dt_str = dt_str[:10].replace(":", ".") + dt_str[10:]
-                                            res["date"] = dt_str
+                                    elif tag == 0xA434 and ftype == 2:  # 镜头型号
+                                        lens_val = _read_tiff_str(tiff, endian, count, val_bytes)
+                                        if lens_val: res["lens"] = lens_val
+
+                                    elif tag in (0x9003, 0x9004) and ftype == 2:  # DateTimeOriginal
+                                        dt_val = _read_tiff_str(tiff, endian, count, val_bytes)
+                                        if len(dt_val) >= 10:
+                                            res["date"] = dt_val[:10].replace(":", ".") + dt_val[10:16]
             idx = seg_end
 
-        # ---------------- 阶段 2: XMP 深度探测兜底 (像素蛋糕 / PS / LR 核心防线) ----------------
-        if res["camera"] == "未知机身" or res["lens"] == "未知镜头" or res["aperture"] == "--":
+        # 整理机身名称
+        if model_str:
+            if make_str and not model_str.lower().startswith(make_str.lower().split()[0]):
+                res["camera"] = f"{make_str.split()[0]} {model_str}".strip()
+            else:
+                res["camera"] = model_str
+        elif make_str:
+            res["camera"] = make_str
+
+        # ---------------- 阶段 2: XMP 深度探测兜底 (完美攻克 Adobe / Lang Alt 嵌套) ----------------
+        if res["camera"] == "未知机身" or res["lens"] == "未知镜头" or res["aperture"] == "--" or res["date"] == "--" or res["ev"] == "--":
             xmp_idx = header_data.find(b'<x:xmpmeta')
             if xmp_idx >= 0:
-                xmp_chunk = header_data[xmp_idx : xmp_idx + 131072]
+                xmp_chunk = header_data[xmp_idx : xmp_idx + 262144]
 
                 def _xmp_find(patterns):
                     for pat in patterns:
-                        m = re.search(pat, xmp_chunk)
+                        m = re.search(pat, xmp_chunk, re.IGNORECASE)
                         if m:
                             try:
-                                return m.group(1).decode('utf-8', 'ignore').strip()
+                                v = m.group(1).decode('utf-8', 'ignore').strip()
+                                if v: return v
                             except Exception:
                                 pass
                     return None
 
-                # 提取机身
+                # 提取机身 (支持 Lang Alt / rdf:li)
                 if res["camera"] == "未知机身":
-                    cam = _xmp_find([rb'<tiff:Model>([^<]+)</tiff:Model>', rb'tiff:Model="([^"]+)"'])
-                    if cam: res["camera"] = cam
+                    m_model = _xmp_find([
+                        rb'<tiff:Model[\s\S]*?<rdf:li[^>]*>([^<]+)</rdf:li>',
+                        rb'<tiff:Model>([^<]+)</tiff:Model>',
+                        rb'tiff:Model="([^"]+)"',
+                    ])
+                    m_make = _xmp_find([
+                        rb'<tiff:Make[\s\S]*?<rdf:li[^>]*>([^<]+)</rdf:li>',
+                        rb'<tiff:Make>([^<]+)</tiff:Make>',
+                        rb'tiff:Make="([^"]+)"',
+                    ])
+                    if m_model:
+                        if m_make and not m_model.lower().startswith(m_make.lower().split()[0]):
+                            res["camera"] = f"{m_make.split()[0]} {m_model}".strip()
+                        else:
+                            res["camera"] = m_model
+                    elif m_make:
+                        res["camera"] = m_make
 
-                # 提取镜头
+                # 提取镜头 (支持 Lang Alt / rdf:li)
                 if res["lens"] == "未知镜头":
-                    lens = _xmp_find([rb'<aux:Lens>([^<]+)</aux:Lens>', rb'aux:Lens="([^"]+)"',
-                                     rb'<exifEX:LensModel>([^<]+)</exifEX:LensModel>', rb'exifEX:LensModel="([^"]+)"'])
-                    if lens: res["lens"] = lens
+                    m_lens = _xmp_find([
+                        rb'<aux:Lens[\s\S]*?<rdf:li[^>]*>([^<]+)</rdf:li>',
+                        rb'<aux:Lens>([^<]+)</aux:Lens>',
+                        rb'aux:Lens="([^"]+)"',
+                        rb'<exifEX:LensModel[\s\S]*?<rdf:li[^>]*>([^<]+)</rdf:li>',
+                        rb'<exifEX:LensModel>([^<]+)</exifEX:LensModel>',
+                        rb'exifEX:LensModel="([^"]+)"',
+                    ])
+                    if m_lens: res["lens"] = m_lens
 
                 # 提取光圈
                 if res["aperture"] == "--":
@@ -1009,8 +1059,7 @@ def parse_photo_exif(file_path: str) -> dict:
                         try:
                             v = eval(ap) if '/' in ap else float(ap)
                             res["aperture"] = f"f/{v:.1f}"
-                        except Exception:
-                            pass
+                        except Exception: pass
 
                 # 提取快门
                 if res["shutter"] == "--":
@@ -1022,12 +1071,15 @@ def parse_photo_exif(file_path: str) -> dict:
                             else:
                                 fv = float(sh)
                                 res["shutter"] = f"{fv:.1f}s" if fv >= 1 else f"1/{round(1.0/fv)}s"
-                        except Exception:
-                            pass
+                        except Exception: pass
 
                 # 提取 ISO
                 if res["iso"] == "--":
-                    iso = _xmp_find([rb'<exif:ISOSpeedRatings>[^<]*<rdf:li>(\d+)</rdf:li>', rb'<exif:PhotographicSensitivity>(\d+)</exif:PhotographicSensitivity>'])
+                    iso = _xmp_find([
+                        rb'<exif:ISOSpeedRatings>[^<]*<rdf:li>(\d+)</rdf:li>',
+                        rb'<exif:PhotographicSensitivity>(\d+)</exif:PhotographicSensitivity>',
+                        rb'exif:PhotographicSensitivity="(\d+)"'
+                    ])
                     if iso: res["iso"] = f"ISO {iso}"
 
                 # 提取焦距
@@ -1037,129 +1089,45 @@ def parse_photo_exif(file_path: str) -> dict:
                         try:
                             v = eval(foc) if '/' in foc else float(foc)
                             res["focal"] = f"{round(v)}mm"
-                        except Exception:
-                            pass
+                        except Exception: pass
 
-                # 提取时间
+                # 提取曝光补偿
+                if res["ev"] == "--":
+                    m_ev = _xmp_find([rb'<exif:ExposureBiasValue>([^<]+)</exif:ExposureBiasValue>', rb'exif:ExposureBiasValue="([^"]+)"'])
+                    if m_ev:
+                        try:
+                            v = eval(m_ev) if '/' in m_ev else float(m_ev)
+                            res["ev"] = f"{v:+.1f} EV" if abs(v) > 0.01 else "0.0 EV"
+                        except Exception: pass
+
+                # 提取拍摄时间 (全量兼容 CreateDate, DateCreated 等)
                 if res["date"] == "--":
-                    dt = _xmp_find([rb'<exif:DateTimeOriginal>([^<]+)</exif:DateTimeOriginal>', rb'exif:DateTimeOriginal="([^"]+)"'])
+                    dt = _xmp_find([
+                        rb'<exif:DateTimeOriginal>([^<]+)</exif:DateTimeOriginal>',
+                        rb'exif:DateTimeOriginal="([^"]+)"',
+                        rb'<xmp:CreateDate>([^<]+)</xmp:CreateDate>',
+                        rb'xmp:CreateDate="([^"]+)"',
+                        rb'<photoshop:DateCreated>([^<]+)</photoshop:DateCreated>',
+                        rb'photoshop:DateCreated="([^"]+)"',
+                        rb'<exif:DateTimeDigitized>([^<]+)</exif:DateTimeDigitized>',
+                        rb'exif:DateTimeDigitized="([^"]+)"',
+                    ])
                     if dt:
-                        res["date"] = dt.replace("T", " ")[:19].replace("-", ".")
-    except Exception:
-        pass
+                        cleaned = dt.replace("T", " ")[:16].replace("-", ".")
+                        if len(cleaned) >= 10:
+                            res["date"] = cleaned[:10].replace(":", ".") + cleaned[10:]
 
-    return res
-
-    try:
-        file_mb = p.stat().st_size / (1024 * 1024)
-        res["size"] = f"{file_mb:.1f} MB"
-
-        reader = QImageReader(file_path)
-        sz = reader.size()
-        if sz.isValid():
-            res["dimensions"] = f"{sz.width()} × {sz.height()}"
-
-        with open(file_path, 'rb') as f:
-            header_data = f.read(131072)
-
-        if len(header_data) < 4 or header_data[:2] != b'\xFF\xD8':
-            if is_raw_file(file_path):
-                _fill_exif_from_raw(res, file_path)
-            return res
-
-        idx = 2
-        while idx < len(header_data) - 4:
-            if header_data[idx] != 0xFF:
-                break
-            marker = header_data[idx + 1]
-            if marker in (0xD9, 0xDA):
-                break
-            length = int.from_bytes(header_data[idx + 2:idx + 4], 'big')
-            if marker == 0xE1:
-                exif_body = header_data[idx + 4 : idx + 2 + length]
-                if exif_body.startswith(b'Exif\x00\x00'):
-                    tiff = exif_body[6:]
-                    if len(tiff) >= 8:
-                        endian_mark = tiff[:2]
-                        endian = '<' if endian_mark == b'II' else ('>' if endian_mark == b'MM' else None)
-                        if endian:
-                            ifd0_offset = struct.unpack(endian + 'I', tiff[4:8])[0]
-                            exif_sub_offset = None
-
-                            if ifd0_offset + 2 <= len(tiff):
-                                num_entries = struct.unpack(endian + 'H', tiff[ifd0_offset : ifd0_offset + 2])[0]
-                                for i in range(num_entries):
-                                    ep = ifd0_offset + 2 + i * 12
-                                    if ep + 12 > len(tiff): break
-                                    tag, ftype, count = struct.unpack(endian + 'HHI', tiff[ep : ep + 8])
-                                    val_bytes = tiff[ep + 8 : ep + 12]
-
-                                    if tag == 0x0110:
-                                        str_offset = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if str_offset < len(tiff):
-                                            raw_str = tiff[str_offset : str_offset + count].split(b'\x00')[0]
-                                            res["camera"] = raw_str.decode('utf-8', errors='ignore').strip()
-                                    elif tag == 0x8769:
-                                        exif_sub_offset = struct.unpack(endian + 'I', val_bytes)[0]
-
-                            if exif_sub_offset and exif_sub_offset + 2 <= len(tiff):
-                                num_sub = struct.unpack(endian + 'H', tiff[exif_sub_offset : exif_sub_offset + 2])[0]
-                                for i in range(num_sub):
-                                    ep = exif_sub_offset + 2 + i * 12
-                                    if ep + 12 > len(tiff): break
-                                    tag, ftype, count = struct.unpack(endian + 'HHI', tiff[ep : ep + 8])
-                                    val_bytes = tiff[ep + 8 : ep + 12]
-
-                                    if tag == 0x829D and ftype == 5:
-                                        r_off = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if r_off + 8 <= len(tiff):
-                                            num, den = struct.unpack(endian + 'II', tiff[r_off : r_off + 8])
-                                            if den != 0: res["aperture"] = f"f/{num/den:.1f}"
-
-                                    elif tag == 0x829A and ftype == 5:
-                                        r_off = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if r_off + 8 <= len(tiff):
-                                            num, den = struct.unpack(endian + 'II', tiff[r_off : r_off + 8])
-                                            if den != 0:
-                                                if num >= den:
-                                                    res["shutter"] = f"{num/den:.1f}s"
-                                                else:
-                                                    res["shutter"] = f"1/{round(den/num)}s"
-
-                                    elif tag == 0x8827:
-                                        iso_val = struct.unpack(endian + 'H', val_bytes[:2])[0]
-                                        res["iso"] = f"ISO {iso_val}"
-
-                                    elif tag == 0x920A and ftype == 5:
-                                        r_off = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if r_off + 8 <= len(tiff):
-                                            num, den = struct.unpack(endian + 'II', tiff[r_off : r_off + 8])
-                                            if den != 0: res["focal"] = f"{num/den:.0f}mm"
-
-                                    elif tag == 0xA434 and ftype == 2:
-                                        str_offset = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if str_offset < len(tiff):
-                                            raw_str = tiff[str_offset : str_offset + count].split(b'\x00')[0]
-                                            res["lens"] = raw_str.decode('utf-8', errors='ignore').strip()
-
-                                    elif tag == 0x9003 and ftype == 2:
-                                        str_offset = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if str_offset < len(tiff):
-                                            raw_str = tiff[str_offset : str_offset + count].split(b'\x00')[0]
-                                            dt_str = raw_str.decode('utf-8', errors='ignore').strip()
-                                            if len(dt_str) >= 10:
-                                                dt_str = dt_str[:10].replace(":", "-") + dt_str[10:]
-                                            res["date"] = dt_str
-
-                                    elif tag == 0x9204 and ftype == 10:
-                                        r_off = struct.unpack(endian + 'I', val_bytes)[0]
-                                        if r_off + 8 <= len(tiff):
-                                            num, den = struct.unpack(endian + 'ii', tiff[r_off : r_off + 8])
-                                            if den != 0:
-                                                ev_val = num / den
-                                                res["ev"] = f"{ev_val:+.1f} EV"
-                break
-            idx += 2 + length
+        # ---------------- 阶段 3: 镜头血统反向推导兜底 ----------------
+        if res["camera"] == "未知机身" and res["lens"] != "未知镜头":
+            l_up = res["lens"].upper()
+            if "NIKKOR" in l_up or "NIKON" in l_up:
+                res["camera"] = "Nikon"
+            elif "CANON" in l_up or l_up.startswith("RF") or l_up.startswith("EF"):
+                res["camera"] = "Canon"
+            elif "SONY" in l_up or l_up.startswith("FE ") or l_up.startswith("E "):
+                res["camera"] = "Sony"
+            elif "FUJINON" in l_up or l_up.startswith("XF") or l_up.startswith("GF"):
+                res["camera"] = "Fujifilm"
     except Exception:
         pass
 

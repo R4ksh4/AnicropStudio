@@ -294,15 +294,15 @@ class WatermarkEngine:
     PREVIEW_BASELINE_DIM = 1600.0
 
     @staticmethod
-    def detect_brand(camera_str: str) -> str:
-        s = camera_str.upper()
-        if "CANON" in s or "EOS" in s:
+    def detect_brand(camera_str: str, lens_str: str = "") -> str:
+        s = (str(camera_str) + " " + str(lens_str)).upper()
+        if "CANON" in s or "EOS" in s or "RF " in s or "EF " in s:
             return "CANON"
-        if "SONY" in s or "ILCE" in s:
+        if "SONY" in s or "ILCE" in s or "SEL" in s:
             return "SONY"
-        if "NIKON" in s:
+        if "NIKON" in s or "NIKKOR" in s:
             return "NIKON"
-        if "FUJIFILM" in s or "FUJI" in s or "GFX" in s:
+        if "FUJIFILM" in s or "FUJI" in s or "GFX" in s or "FUJINON" in s:
             return "FUJIFILM"
         if "LEICA" in s:
             return "LEICA"
@@ -598,7 +598,7 @@ class WatermarkEngine:
             shutter_str = exif_data.get("shutter", "--")
             iso_str = exif_data.get("iso", "--")
             date_str = exif_data.get("date", "--")
-            brand = cls.detect_brand(cam_str)
+            brand = cls.detect_brand(cam_str, lens_str)
 
             # 毛玻璃背景下顶栏文字智能转为高亮亮白并带轻微微阴影，防止暗部隐形
             if bg_type == "blur":

@@ -1,5 +1,6 @@
 from watermark_ui import WatermarkPageWidget
 from inpaint_ui import InpaintPageWidget
+from airlink_ui import AirLinkPageWidget
 from boot_flash import BootFlash
 import sys
 import os
@@ -957,7 +958,7 @@ class SettingsPageWidget(QWidget):
         about_layout.setSpacing(12)
         about_layout.setContentsMargins(16, 18, 16, 16)
 
-        lbl_app_info = QLabel("Anicrop Studio (Beta 4.0.0)")
+        lbl_app_info = QLabel("Anicrop Studio (Beta 4.1.0)")
         lbl_app_info.setStyleSheet("font-size: 15px; font-weight: bold; color: #38bdf8;")
         about_layout.addWidget(lbl_app_info)
 
@@ -1187,7 +1188,7 @@ class SettingsPageWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Anicrop Studio - 二次元漫展返图流极客工作台 [Beta 4.0.0]")
+        self.setWindowTitle("Anicrop Studio - 二次元漫展返图流极客工作台 [Beta 4.1.0]")
         self.resize(1320, 880)
         self.setMinimumSize(1024, 720)
         self.setStyleSheet(DARK_STYLE_SHEET)
@@ -1242,9 +1243,15 @@ class MainWindow(QMainWindow):
         self.btn_tab_inpaint.clicked.connect(lambda: self._switch_tab(3))
         top_nav_layout.addWidget(self.btn_tab_inpaint)
 
+        self.btn_tab_airlink = QPushButton("📡 隔空极速快传")
+        self.btn_tab_airlink.setProperty("class", "NavTab")
+        self.btn_tab_airlink.setToolTip("移动端局域极速快传站 (iOS 优化版)")
+        self.btn_tab_airlink.clicked.connect(lambda: self._switch_tab(4))
+        top_nav_layout.addWidget(self.btn_tab_airlink)
+
         self.btn_tab_settings = QPushButton("⚙️ 系统偏好设置")
         self.btn_tab_settings.setProperty("class", "NavTab")
-        self.btn_tab_settings.clicked.connect(lambda: self._switch_tab(4))
+        self.btn_tab_settings.clicked.connect(lambda: self._switch_tab(5))
         top_nav_layout.addWidget(self.btn_tab_settings)
 
         top_nav_layout.addStretch()
@@ -1376,7 +1383,11 @@ class MainWindow(QMainWindow):
         self.page_inpaint.sig_photo_loaded.connect(lambda p: self._on_photo_selected(p, 0, 1))
         self.stack.addWidget(self.page_inpaint)
 
-        # Page 4: 系统偏好设置
+        # Page 4: 移动端局域极速快传站 (Air-Link 挂载点)
+        self.page_airlink = AirLinkPageWidget()
+        self.stack.addWidget(self.page_airlink)
+
+        # Page 5: 系统偏好设置
         self.page_settings = SettingsPageWidget()
         self.page_settings.sig_default_path_changed.connect(self._on_default_path_updated)
         self.stack.addWidget(self.page_settings)
@@ -1434,7 +1445,10 @@ class MainWindow(QMainWindow):
         else:
             self.toolbar_stack.setVisible(False)
 
-        tabs = [self.btn_tab_album, self.btn_tab_darkroom, self.btn_tab_watermark, self.btn_tab_inpaint, self.btn_tab_settings]
+        tabs = [
+            self.btn_tab_album, self.btn_tab_darkroom, self.btn_tab_watermark,
+            self.btn_tab_inpaint, self.btn_tab_airlink, self.btn_tab_settings
+        ]
         for i, b in enumerate(tabs):
             b.setProperty("class", "NavTab NavTabActive" if i == index else "NavTab")
             b.style().polish(b)
@@ -1442,7 +1456,14 @@ class MainWindow(QMainWindow):
         # 魔法消除模块同步放行点亮 EXIF 拍摄参数面板
         self.exif_group.setVisible(index in (0, 1, 3))
 
-        title_map = {0: "🖼️ 漫展画廊初筛", 1: "🧪 极客暗房工坊", 2: "🏷️ 参数画框工作台", 3: "🪄 魔法消除工作台", 4: "⚙️ 系统全局偏好"}
+        title_map = {
+            0: "🖼️ 漫展画廊初筛",
+            1: "🧪 极客暗房工坊",
+            2: "🏷️ 参数画框工作台",
+            3: "🪄 魔法消除工作台",
+            4: "📡 移动端隔空快传",
+            5: "⚙️ 系统全局偏好"
+        }
         self.rail_title.setText(title_map.get(index, "📌 空间看板"))
         
     def _on_photo_selected(self, file_path: str, idx: int, total: int):

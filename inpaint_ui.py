@@ -45,7 +45,51 @@ def imread_unicode(path: str) -> np.ndarray | None:
         return None
 
 
-def imwrite_unicode(path: str, img: np.ndarray, quality: int = 95) -> bool:
+def _extract_metadata_segments(src_path: str) -> list[bytes]:
+    """从底图源文件物理提取 APP1~APP15 (EXIF/XMP/ICC) 与 COM 等全部元数据段"""
+    segments = []
+    if not src_path or not os.path.exists(src_path):
+        return segments
+
+    raw_data = None
+    try:
+        ext = Path(src_path).suffix.lower()
+        # 若底图源自 RAW，定点抽调内嵌 JPEG 预览的元数据段
+        if ext in {".cr3", ".cr2", ".arw", ".nef", ".dng", ".orf", ".rw2"}:
+            from album import extract_raw_embedded_jpeg
+            raw_data = extract_raw_embedded_jpeg(src_path)
+        else:
+            with open(src_path, "rb") as f:
+                raw_data = f.read(2 * 1024 * 1024)  # 读取头部 2MB 足够吃下全部元数据
+    except Exception:
+        return segments
+
+    if not raw_data or len(raw_data) < 4 or raw_data[:2] != b"\xff\xd8":
+        return segments
+
+    idx = 2
+    n = len(raw_data)
+    while idx < n - 4:
+        if raw_data[idx] != 0xFF:
+            break
+        marker = raw_data[idx + 1]
+        # 遇到图像压缩数据与表标记停止扫描
+        if marker in (0xD9, 0xDA, 0xC0, 0xC1, 0xC2, 0xC4, 0xDB):
+            break
+        length = int.from_bytes(raw_data[idx + 2 : idx + 4], "big")
+        seg_end = idx + 2 + length
+        if seg_end > n:
+            break
+        # 精准保留 APP1 (Exif/XMP), APP2 (ICC), APP13 (IPTC), COM 等全部有效段，避开 APP0 防编码冲突
+        if 0xE1 <= marker <= 0xEF or marker == 0xFE:
+            segments.append(raw_data[idx:seg_end])
+        idx = seg_end
+
+    return segments
+
+
+def imwrite_unicode(path: str, img: np.ndarray, quality: int = 95, orig_file_path: str = "") -> bool:
+    """满血图像写入引擎：支持 Unicode 路径并无损嫁接注入底图的 EXIF/XMP/ICC 元数据"""
     try:
         ext = Path(path).suffix.lower()
         if ext in ('.jpg', '.jpeg'):
@@ -55,10 +99,26 @@ def imwrite_unicode(path: str, img: np.ndarray, quality: int = 95) -> bool:
         else:
             params = []
         res, buf = cv2.imencode(ext, img, params)
-        if res:
-            buf.tofile(path)
-            return True
-        return False
+        if not res:
+            return False
+
+        data_bytes = buf.tobytes()
+
+        # 核心：对导出的 JPEG 注入底图完整的 EXIF/XMP/相机/镜头/ICC 广色域元数据
+        if ext in ('.jpg', '.jpeg') and orig_file_path:
+            meta_segs = _extract_metadata_segments(orig_file_path)
+            if meta_segs and len(data_bytes) >= 2 and data_bytes[:2] == b'\xff\xd8':
+                insert_pos = 2
+                # 若 OpenCV 生成了 APP0 (JFIF)，插在 APP0 之后，避免破坏解析结构
+                if len(data_bytes) > 4 and data_bytes[2:4] == b'\xff\xe0':
+                    app0_len = int.from_bytes(data_bytes[4:6], 'big')
+                    insert_pos = 2 + 2 + app0_len
+                meta_payload = b''.join(meta_segs)
+                data_bytes = data_bytes[:insert_pos] + meta_payload + data_bytes[insert_pos:]
+
+        with open(path, 'wb') as f:
+            f.write(data_bytes)
+        return True
     except Exception:
         return False
 
@@ -569,8 +629,26 @@ class InpaintWorkbenchWidget(QWidget):
         self.btn_undo.setStyleSheet("color: #38bdf8; font-weight: bold; padding: 6px 16px;" if can_undo else "color: #52525b; padding: 6px 16px;")
         self.btn_redo.setStyleSheet("color: #38bdf8; font-weight: bold; padding: 6px 16px;" if can_redo else "color: #52525b; padding: 6px 16px;")
 
+    def _clear_all_to_clean_canvas(self):
+        """【一键清屏·纯手动流】清空全部 AI 自动选区与涂抹笔刷，秒回 100% 纯净底图"""
+        if self.orig_bgr is None:
+            return
+        self._push_undo_snapshot()
+        self.selected_blob_ids.clear()
+        if self.manual_brush_mask is not None:
+            self.manual_brush_mask.fill(0)
+        if self.override_brush_mask is not None:
+            self.override_brush_mask.fill(0)
+        if self.manual_erase_mask is not None:
+            self.manual_erase_mask.fill(0)
+        self.particles.clear()
+        self._recompute_fusion()
+        self._refresh_stats_label()
+        self._update_undo_redo_ui()
+        self.viewport.update()
+
     def _clear_brush_and_erase(self):
-        """【已补齐核心】点击重置按钮：清空所有手动笔刷，恢复初始消除状态"""
+        """【重置】清空手动笔刷，恢复为 AI 自动探测圈选的初始状态"""
         self._push_undo_snapshot()
         if self.manual_brush_mask is not None:
             self.manual_brush_mask.fill(0)
@@ -581,6 +659,7 @@ class InpaintWorkbenchWidget(QWidget):
         self.selected_blob_ids = {b["id"] for b in self.candidate_blobs}
         self._recompute_fusion()
         self._refresh_stats_label()
+        self._update_undo_redo_ui()
         self.viewport.update()
 
     def _on_anim_tick(self):
@@ -770,8 +849,27 @@ class InpaintWorkbenchWidget(QWidget):
         self.btn_tool_eraser.clicked.connect(lambda: self._set_tool("eraser"))
         self.btn_override_toggle.clicked.connect(self._toggle_override_shield)
 
+        self.btn_clear_screen = QPushButton("🧹 清屏")
+        self.btn_clear_screen.setToolTip("一键清空全部消除区域，秒回纯净底图（纯手动党专属）")
+        self.btn_clear_screen.setFocusPolicy(Qt.NoFocus)
+        self.btn_clear_screen.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(239, 68, 68, 24);
+                border: 1px solid rgba(239, 68, 68, 75);
+                color: #f87171;
+                border-radius: 16px;
+                padding: 6px 15px;
+            }
+            QPushButton:hover {
+                background-color: rgba(239, 68, 68, 50);
+                color: #ffffff;
+            }
+        """)
+        self.btn_clear_screen.clicked.connect(self._clear_all_to_clean_canvas)
+        dock_layout.addWidget(self.btn_clear_screen)
+
         self.btn_clear_all_brush = QPushButton("🔄 重置")
-        self.btn_clear_all_brush.setToolTip("重置为初始状态")
+        self.btn_clear_all_brush.setToolTip("恢复为 AI 自动探测圈选的初始状态")
         self.btn_clear_all_brush.setFocusPolicy(Qt.NoFocus)
         self.btn_clear_all_brush.setStyleSheet("""
             QPushButton {
@@ -779,7 +877,7 @@ class InpaintWorkbenchWidget(QWidget):
                 border: 1px solid rgba(249, 115, 22, 75);
                 color: #fb923c;
                 border-radius: 16px;
-                padding: 6px 16px;
+                padding: 6px 15px;
             }
             QPushButton:hover {
                 background-color: rgba(249, 115, 22, 45);
@@ -813,7 +911,7 @@ class InpaintWorkbenchWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        dw = min(920, max(840, self.viewport.width() - 80))
+        dw = min(980, max(880, self.viewport.width() - 40))
         dh = 52
         dx = (self.viewport.width() - dw) // 2
         dy = self.viewport.height() - dh - 24
@@ -1351,14 +1449,17 @@ class InpaintWorkbenchWidget(QWidget):
         super().keyReleaseEvent(event)
 
     def _save_as(self):
-        p = Path(self.orig_file_path)
+        default_dir = Path(self.orig_file_path).parent if self.orig_file_path else Path.home()
+        default_stem = Path(self.orig_file_path).stem if self.orig_file_path else "inpainted_photo"
+        default_name = str(default_dir / f"{default_stem}_inpainted.jpg")
+
         out, _ = QFileDialog.getSaveFileName(
             self, "另存为满血成片",
-            str(p.parent / f"{p.stem}_inpainted.jpg"),
+            default_name,
             "JPEG 图像 (*.jpg);;PNG 图像 (*.png)"
         )
-        if out and imwrite_unicode(out, self.fused_bgr, quality=96):
-            QMessageBox.information(self, "保存成功", f"满血无损成片已保存至：\n{out}")
+        if out and imwrite_unicode(out, self.fused_bgr, quality=96, orig_file_path=self.orig_file_path):
+            QMessageBox.information(self, "保存成功", f"满血成片已保存至：\n{out}\n\n已成功保留并注入原始 EXIF 拍摄参数、镜头型号与色彩配置！")
 
 
 # ==============================================================================
