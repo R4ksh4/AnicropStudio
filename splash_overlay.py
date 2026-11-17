@@ -15,8 +15,13 @@ from PySide6.QtGui import QPainter, QColor, QFont
 
 
 
+try:
+    from main import APP_VERSION
+except Exception:
+    APP_VERSION = "Beta 4.2.0"
+
 BOOT_LINES = [
-    ("Anicrop Studio Kernel Beta 2.0.0", 0.15),
+    (f"Anicrop Studio Kernel {APP_VERSION}", 0.15),
     ("Copyright (c) 2026 R4ksh4. All rights reserved.", 0.10),
     ("", 0.08),
     ("[    0.000000] Booting Anicrop Studio...", 0.12),

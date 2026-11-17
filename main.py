@@ -2,7 +2,9 @@
 import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QSettings
-from ui import MainWindow
+
+# 唯一全局版本号入口：以后发版只改这一行
+APP_VERSION = "Beta 4.2.0"
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -29,16 +31,24 @@ def main():
     app.setApplicationName("AnicropStudio")
     app.setOrganizationName("AnicropGeeks")
 
-    # 2. 动态解析图标绝对路径 (开发环境与打包环境 100% 互通)
+    # 2. 动态解析图标绝对路径 (源码 / onefile / onedir 全打通)
     from PySide6.QtGui import QIcon
+    search_roots = []
+    if hasattr(sys, '_MEIPASS'):
+        search_roots.append(Path(sys._MEIPASS))
     if getattr(sys, 'frozen', False):
-        base_dir = Path(sys._MEIPASS if hasattr(sys, '_MEIPASS') else sys.executable).parent
-    else:
-        base_dir = Path(__file__).resolve().parent
+        search_roots.append(Path(sys.executable).parent)
+    search_roots.append(Path(__file__).resolve().parent)
 
-    icon_path = base_dir / "assets" / "anicrop.ico"
-    if not icon_path.exists():
-        icon_path = base_dir / "anicrop.ico"  # 兜底备用：根目录
+    icon_path = Path()
+    for root in search_roots:
+        for rel in (Path("assets") / "anicrop.ico", Path("anicrop.ico")):
+            cand = root / rel
+            if cand.exists():
+                icon_path = cand
+                break
+        if icon_path.exists():
+            break
 
     if icon_path.exists():
         app_icon = QIcon(str(icon_path))
@@ -62,11 +72,12 @@ def main():
     dark_palette.setColor(QPalette.HighlightedText, QColor("#ffffff"))
     app.setPalette(dark_palette)
 
+    from ui import MainWindow
     window = MainWindow()
     if icon_path.exists():
         window.setWindowIcon(app_icon)
     window.show()
-    window.show()
+
 
     # 首次启动才播 splash
     settings = QSettings("AnicropGeeks", "AnicropStudio")

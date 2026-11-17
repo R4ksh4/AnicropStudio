@@ -23,10 +23,15 @@ from PySide6.QtGui import QPainter, QColor, QFont, QKeyEvent, QMouseEvent
 
 
 
+try:
+    from main import APP_VERSION
+except Exception:
+    APP_VERSION = "Beta 4.2.0"
+
 # ==================== 自检日志内容 ====================
 # (文本, 下一行出现的间隔秒数)
 BOOT_LINES = [
-    ("Anicrop Studio Kernel Beta 4.1.0", 0.15),
+    (f"Anicrop Studio Kernel {APP_VERSION}", 0.15),
     ("Copyright (c) 2026 R4ksh4. All rights reserved.", 0.10),
     ("", 0.08),
     ("[    0.000000] Booting Anicrop Studio...", 0.12),

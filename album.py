@@ -12,6 +12,7 @@ import sys
 import math
 import struct
 import hashlib
+import json
 import re
 from collections import OrderedDict
 import time
@@ -44,18 +45,20 @@ VALID_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # 用户可在 设置 -> 快捷键 中改绑 A~Z 字母键；QSettings 持久化，即时生效
 # ══════════════════════════════════════════════════════════════
 DEFAULT_SHORTCUTS = {
-    "prev":           ("A", "单图 - 上一张照片", "←"),
-    "next":           ("D", "单图 - 下一张照片", "→"),
+    "prev":           ("A", "单图 - 上一张照片", ""),
+    "next":           ("D", "单图 - 下一张照片", ""),
     "cmp_l_prev":     ("U", "对比 - 左图上一张", ""),
     "cmp_l_next":     ("I", "对比 - 左图下一张", ""),
     "cmp_r_prev":     ("O", "对比 - 右图上一张", ""),
     "cmp_r_next":     ("P", "对比 - 右图下一张", ""),
     "mark":           ("H", "标记 / 取消标记 (选片/废片)", "X / Delete"),
-    "eye_zoom":       ("R", "眼部特写 开/关", "鼠标双击"),
+    "eye_zoom":       ("R", "眼部特写 开/关", ""),
+    "lock_viewport":  ("V", "放大切图锁定 开/关", ""),
     "af":             ("F", "对焦点显示 开/关", ""),
     "compare":        ("C", "对比模式 开/关", ""),
     "grid":           ("Q", "构图辅助线 循环切换", "Shift+Q 翻转螺旋象限"),
     "precrop":        ("W", "预裁剪遮罩 循环切换", ""),
+    "trash":          ("G", "暗房 - 丢入废片篓", "Backspace"),
 }
 
 
@@ -63,6 +66,8 @@ DEFAULT_SHORTCUTS = {
 FIXED_SHORTCUTS = [
     ("Esc", "退出沉浸全屏 / 返回画廊"),
     ("Space", "沉浸全屏 开/关"),
+    ("长按右键", "战术开镜放大（滚轮调倍率，松手自动还原）"),
+    ("Shift + Q", "螺旋构图模式下翻转螺旋象限"),
     ("↑ ↓ ← →", "画面上下左右平移漫游"),
     ("0 ~ 5", "打星：0=清除，1~5=星级（与 DPP / Lightroom 互通）"),
     ("Ctrl + 滚轮", "以光标为锚点顺滑缩放"),
@@ -1572,12 +1577,14 @@ class ThumbnailSignals(QObject):
     provisional_used = Signal(str)   # (路径) 预热档用了 EXIF 小图/未出图，需要升级梯队补高清
 
 class ThumbnailTask(QRunnable):
-    def __init__(self, file_path: str, target_cache_dir: Path, target_size: int = 512, provisional_ok: bool = False):
+    def __init__(self, file_path: str, target_cache_dir: Path, target_size: int = 512,
+                 provisional_ok: bool = False, skip_meta: bool = False):
         super().__init__()
         self.file_path = file_path
         self.target_cache_dir = target_cache_dir
         self.target_size = target_size
         self.provisional_ok = provisional_ok
+        self.skip_meta = skip_meta
         self.signals = ThumbnailSignals()
 
     def _safe_emit(self, sig, *args):
@@ -1589,29 +1596,34 @@ class ThumbnailTask(QRunnable):
             pass
 
     def run(self):
-        if is_raw_file(self.file_path):
-            try:
-                _raw_bundle(self.file_path, light=True)
-            except Exception:
-                pass
-        self._safe_emit(self.signals.meta_loaded, self.file_path, parse_photo_rating(self.file_path))
         try:
             mtime = os.path.getmtime(self.file_path)
             hash_str = f"{self.file_path}_{mtime}"
             cache_key = hashlib.md5(hash_str.encode("utf-8")).hexdigest()
             cache_file = self.target_cache_dir / f"{cache_key}.jpg"
 
+            # 1. 命中磁盘缩略图缓存：直接秒读小图，星级若已缓存则彻底零触碰原始大图
             if cache_file.exists():
                 img = QImage(str(cache_file))
                 if not img.isNull():
+                    if not self.skip_meta:
+                        self._safe_emit(self.signals.meta_loaded, self.file_path, parse_photo_rating(self.file_path))
                     self._safe_emit(self.signals.loaded, self.file_path, img)
                     return
+
+            # 2. 未命中缓存：按需预热 RAW 并读取星级
+            if is_raw_file(self.file_path):
+                try:
+                    _raw_bundle(self.file_path, light=True)
+                except Exception:
+                    pass
+            if not self.skip_meta:
+                self._safe_emit(self.signals.meta_loaded, self.file_path, parse_photo_rating(self.file_path))
 
             if is_raw_file(self.file_path):
                 raw_img = load_photo_qimage(self.file_path, light=True)
                 img = raw_img.scaled(self.target_size, self.target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation) if not raw_img.isNull() else QImage()
             elif self.provisional_ok:
-                img = None
                 try:
                     tb, tor = extract_exif_thumb_and_orientation(self.file_path)
                     if tb:
@@ -1657,6 +1669,7 @@ class ThumbnailTask(QRunnable):
                     reader.setScaledSize(scaled_size)
                 img = reader.read()
                 _crashlog(f"[thumb] JPG全量解码完成 {self.file_path} null={img.isNull()}")
+
             if not img.isNull():
                 try:
                     img.save(str(cache_file), "JPG", 85)
@@ -1667,96 +1680,6 @@ class ThumbnailTask(QRunnable):
             pass
         finally:
             self._safe_emit(self.signals.task_done, self.file_path)
-        # RAW 缩略图批量遍历：先预热轻量 bundle（一趟读盘，只抽预览/星级，跳过 TIFF 枚举/EXIF/AF 派生），
-        # 随后的 parse_photo_rating / load_photo_qimage 全部命中同一缓存条目
-        if is_raw_file(self.file_path):
-            try:
-                _raw_bundle(self.file_path, light=True)
-            except Exception:
-                pass
-        try:
-            self.signals.meta_loaded.emit(self.file_path, parse_photo_rating(self.file_path))
-        except Exception:
-            pass
-        try:
-            mtime = os.path.getmtime(self.file_path)
-            hash_str = f"{self.file_path}_{mtime}"
-            cache_key = hashlib.md5(hash_str.encode("utf-8")).hexdigest()
-            cache_file = self.target_cache_dir / f"{cache_key}.jpg"
-
-            if cache_file.exists():
-                img = QImage(str(cache_file))
-                if not img.isNull():
-                    self.signals.loaded.emit(self.file_path, img)
-                    return  # task_done 由 finally 统一发，切勿重复（会冲爆预热计数）
-
-            if is_raw_file(self.file_path):
-                # RAW：抽内嵌预览再缩略（不解析 RAW；轻量 bundle，跳过 EXIF/AF 派生）
-                raw_img = load_photo_qimage(self.file_path, light=True)
-                img = raw_img.scaled(self.target_size, self.target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation) if not raw_img.isNull() else QImage()
-            elif self.provisional_ok:
-                # JPG 预热档：只读文件头抠 EXIF 内嵌小图（~128KB/张），整图解码留给升级梯队。
-                # 无论小图成败都挂进升级队列（没有小图的交给升级梯队全量解码）
-                img = None
-                try:
-                    tb, tor = extract_exif_thumb_and_orientation(self.file_path)
-                    if tb:
-                        timg = QImage.fromData(tb)
-                        if not timg.isNull():
-                            if tor == 6:
-                                timg = timg.transformed(QTransform().rotate(90.0))
-                            elif tor == 8:
-                                timg = timg.transformed(QTransform().rotate(-90.0))
-                            elif tor == 3:
-                                timg = timg.transformed(QTransform().rotate(180.0))
-                            timg = timg.scaled(self.target_size, self.target_size, Qt.KeepAspectRatio, Qt.FastTransformation)
-                            self.signals.loaded.emit(self.file_path, timg)
-                except Exception:
-                    pass
-                try:
-                    self.signals.provisional_used.emit(self.file_path)
-                except Exception:
-                    pass
-                return  # task_done 由 finally 统一发，切勿重复（会冲爆预热计数）
-            elif self.file_path in _POISON_FILES:
-                # 上次崩溃的疑似凶手文件：跳过全量解码，退回 EXIF 小图兜底
-                _crashlog(f"[thumb] 跳过黑名单文件 {self.file_path}")
-                try:
-                    tb, tor = extract_exif_thumb_and_orientation(self.file_path)
-                    if tb:
-                        timg = QImage.fromData(tb)
-                        if not timg.isNull():
-                            if tor == 6:
-                                timg = timg.transformed(QTransform().rotate(90.0))
-                            elif tor == 8:
-                                timg = timg.transformed(QTransform().rotate(-90.0))
-                            elif tor == 3:
-                                timg = timg.transformed(QTransform().rotate(180.0))
-                            self.signals.loaded.emit(self.file_path, timg.scaled(
-                                self.target_size, self.target_size, Qt.KeepAspectRatio, Qt.FastTransformation))
-                except Exception:
-                    pass
-                return
-            else:
-                _crashlog(f"[thumb] JPG全量解码开始 {self.file_path}")
-                reader = QImageReader(self.file_path)
-                reader.setAutoTransform(True)
-                orig_size = reader.size()
-                if orig_size.isValid() and orig_size.width() > 0 and orig_size.height() > 0:
-                    scaled_size = orig_size.scaled(self.target_size, self.target_size, Qt.KeepAspectRatio)
-                    reader.setScaledSize(scaled_size)
-                img = reader.read()
-                _crashlog(f"[thumb] JPG全量解码完成 {self.file_path} null={img.isNull()}")
-            if not img.isNull():
-                try:
-                    img.save(str(cache_file), "JPG", 85)
-                except Exception:
-                    pass
-                self.signals.loaded.emit(self.file_path, img)
-        except Exception:
-            pass
-        finally:
-            self.signals.task_done.emit(self.file_path)
 
 class PhotoListModel(QAbstractListModel):
     ROLE_IS_DIR = Qt.UserRole + 1
@@ -2458,6 +2381,8 @@ class SinglePhotoViewer(QWidget):
         self.compare_face_rect = None
         self.compare_af_boxes = []
         self.active_pane = 0
+        self.compare_sync = False
+        self.lock_viewport_on_switch = False
 
         self._init_overlays()
         # COD 狙击手长按开镜状态机 (Hold-to-ADS + 可变倍率滚轮调焦)
@@ -2587,6 +2512,21 @@ class SinglePhotoViewer(QWidget):
         self.btn_compare.setStyleSheet(self._COMPARE_BTN_NORMAL)
         self.btn_compare.setToolTip(f"对比模式 ({load_shortcuts()['compare']})")
         self.btn_compare.clicked.connect(self._toggle_compare)
+
+        self._SYNC_BTN_NORMAL = "QPushButton { background-color: transparent; border: 1px solid transparent; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #d4d4d8; } QPushButton:hover { background-color: #27272e; color: #c084fc; }"
+        self._SYNC_BTN_ACTIVE = "QPushButton { background-color: #3b185f; border: 1px solid #7c3aed; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #c084fc; }"
+        self.btn_compare_sync = QPushButton("🔗 同步")
+        self.btn_compare_sync.setStyleSheet(self._SYNC_BTN_NORMAL)
+        self.btn_compare_sync.setToolTip("锁定同步左右对比窗格的缩放与平移")
+        self.btn_compare_sync.setVisible(False)
+        self.btn_compare_sync.clicked.connect(self._toggle_compare_sync)
+
+        self._LOCK_VP_NORMAL = "QPushButton { background-color: transparent; border: 1px solid transparent; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #d4d4d8; } QPushButton:hover { background-color: #27272e; color: #38bdf8; }"
+        self._LOCK_VP_ACTIVE = "QPushButton { background-color: #0c4a6e; border: 1px solid #0284c7; border-radius: 2px; font-weight: 600; font-size: 11px; min-height: 20px; max-height: 20px; padding: 0 8px; color: #38bdf8; }"
+        self.btn_lock_viewport = QPushButton("🔓 锁视口")
+        self.btn_lock_viewport.setStyleSheet(self._LOCK_VP_NORMAL)
+        self.btn_lock_viewport.setToolTip(f"放大切图锁定 ({load_shortcuts().get('lock_viewport', 'V')})：切图保持当前放大倍率与位置")
+        self.btn_lock_viewport.clicked.connect(self._toggle_lock_viewport)
 
         self.grid_mode = 0  # 0:关, 1:三分线, 2:黄金分割, 3:黄金螺旋, 4:对角三角, 5:中心十字
         self.spiral_orientation = 0  # 0:右上, 1:右下, 2:左下, 3:左上 (Shift+Q 翻转)
@@ -2730,8 +2670,26 @@ class SinglePhotoViewer(QWidget):
         self.star_bar = StarRatingBar(self)
         self.star_bar.sig_rating_clicked.connect(self._on_star_bar_clicked)
 
+        # 8. 最底沿常驻快捷键提示底栏（1:1 复刻缩略图 bottom_bar 外框+内嵌胶囊边质感）
+        self.viewer_bottom_bar = QFrame(self)
+        self.viewer_bottom_bar.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.viewer_bottom_bar.setStyleSheet("background-color: #18181b; border-radius: 6px; border: 1px solid #27272a;")
+        vh_layout = QHBoxLayout(self.viewer_bottom_bar)
+        vh_layout.setContentsMargins(12, 4, 16, 4)
+        self.lbl_viewer_hint = QLabel(self.viewer_bottom_bar)
+        self.lbl_viewer_hint.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.lbl_viewer_hint.setStyleSheet("color: #71717a; font-size: 11px;")
+        vh_layout.addWidget(self.lbl_viewer_hint)
+        vh_layout.addStretch()
+        self.lbl_dark_viewer_stats = QLabel("", self.viewer_bottom_bar)
+        self.lbl_dark_viewer_stats.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_dark_viewer_stats.setStyleSheet("color: #a1a1aa; font-size: 11px; font-weight: bold; padding: 0 6px;")
+        self.lbl_dark_viewer_stats.setVisible(False)
+        vh_layout.addWidget(self.lbl_dark_viewer_stats)
+
         # 【全键盘驾驶舱防线】彻底剥夺所有悬浮/工具按钮的键盘焦点，杜绝方向键被抢！
         for b in (self.btn_back, self.btn_eye_zoom, self.btn_af_toggle, self.btn_compare,
+                  self.btn_compare_sync, self.btn_lock_viewport,
                   self.btn_grid_toggle, self.btn_crop_toggle, self.btn_cinema_fullscreen, self.btn_filmstrip_toggle,
                   self.btn_mark_toggle, self.btn_prev, self.btn_next, self.btn_cmp_left_next,
                   self.btn_cmp_right_prev, self.btn_zoom_menu):
@@ -2744,12 +2702,28 @@ class SinglePhotoViewer(QWidget):
         super().showEvent(event)
         # 页面再次切回进入时，确保所有控件重新核准坐标，杜绝隐藏进入后按钮沉底消失
         self._relayout_overlays()
+        QTimer.singleShot(0, self._relayout_overlays)
         self.setFocus()
 
     def _relayout_overlays(self):
         w, h = self.width(), self.height()
         if w <= 0 or h <= 0:
             return
+
+        # 让文件名死死居中于照片视口正上方中轴线，不受右侧胶囊宽度变化挤压
+        bar = self.lbl_filename.parentWidget()
+        if bar is not None and bar.isVisible() and bar.width() > 0:
+            if bar.layout() is not None:
+                bar.layout().activate()
+            self.lbl_filename.adjustSize()
+            lbl_w = self.lbl_filename.sizeHint().width()
+            center_x = bar.mapFromGlobal(self.mapToGlobal(QPoint(w // 2, 0))).x()
+            right_limit = bar.width() - 12
+            for child in bar.children():
+                if isinstance(child, QFrame) and child is not self.lbl_filename and child.isVisible():
+                    right_limit = min(right_limit, child.x() - 8)
+            x = max(self.btn_back.width() + 8, min(right_limit - lbl_w, center_x - lbl_w // 2))
+            self.lbl_filename.setGeometry(x, 0, lbl_w, bar.height())
 
         if self.compare_mode:
             half = w // 2
@@ -2763,17 +2737,23 @@ class SinglePhotoViewer(QWidget):
         self.minimap.move(w - 196, 16)
 
         film_h = 86 if self.filmstrip_view.isVisible() else 0
+        hint_h = 30 if self.viewer_bottom_bar.isVisible() else 0
 
-        # 定位悬浮控制栏
-        self.tool_box.move(16, h - 38 - film_h)
+        if self.viewer_bottom_bar.isVisible():
+            self.viewer_bottom_bar.setGeometry(0, h - 30 - film_h, w, 30)
+            self._refresh_viewer_hint()
+
+        # 定位悬浮控制栏（整体避让底部提示条与胶卷条）
+        self.tool_box.move(16, h - 38 - hint_h - film_h)
         self.zoom_box.adjustSize()
-        self.zoom_box.move(w - self.zoom_box.width() - 16, h - 38 - film_h)
-        self.star_bar.move((w - self.star_bar.width()) // 2, h - 48 - film_h)
+        self.zoom_box.move(w - self.zoom_box.width() - 16, h - 38 - hint_h - film_h)
+        self.star_bar.move((w - self.star_bar.width()) // 2, h - 48 - hint_h - film_h)
 
         if self.filmstrip_view.isVisible():
             self.filmstrip_view.setGeometry(0, h - 86, w, 86)
 
         # 核心防消失铁律：悬浮工具条的物理 Z-Order 永远置顶，绝不被胶卷条反向吞噬
+        self.viewer_bottom_bar.raise_()
         self.tool_box.raise_()
         self.zoom_box.raise_()
         self.star_bar.raise_()
@@ -2783,9 +2763,49 @@ class SinglePhotoViewer(QWidget):
             self.btn_cmp_left_next.raise_()
             self.btn_cmp_right_prev.raise_()
 
+    def set_darkroom_stats(self, text: str):
+        if not getattr(self, "lbl_dark_viewer_stats", None):
+            return
+        if self.is_darkroom and text:
+            self.lbl_dark_viewer_stats.setText(text)
+            self.lbl_dark_viewer_stats.setVisible(True)
+        else:
+            self.lbl_dark_viewer_stats.setVisible(False)
+        self._refresh_viewer_hint()
+
+    def _refresh_viewer_hint(self):
+        sc = load_shortcuts()
+        if getattr(self, "is_trash_view_mode", False):
+            txt = (
+                f"💡 废片篓复审：【{sc['prev']}/{sc['next']}】切图  "
+                f"【{sc['eye_zoom']}】特写  【{sc.get('lock_viewport', 'V')}】锁视口  "
+                f"【长按右键】开镜  |  点击下方「↩️ 恢复到暗房」捞回 / 「🧨 彻底删除」移出记录"
+            )
+        else:
+            cmp_part = (
+                f"【{sc['cmp_l_prev']}/{sc['cmp_l_next']}】左图  【{sc['cmp_r_prev']}/{sc['cmp_r_next']}】右图"
+                if self.compare_mode
+                else f"【{sc['prev']}/{sc['next']}】切图"
+            )
+            if self.is_darkroom:
+                mark_part = f"【{sc['mark']}】标好片/取消  【{sc.get('trash', 'G')}】丢废片篓"
+            else:
+                mark_part = f"【{sc['mark']}】选入暗房"
+            txt = (
+                f"💡 提示：{cmp_part}  【{sc['eye_zoom']}】特写  【{sc.get('lock_viewport', 'V')}】锁视口  "
+                f"【{sc['af']}】对焦框  【{sc['compare']}】对比  【{sc.get('grid', 'Q')}】构图  "
+                f"【{sc.get('precrop', 'W')}】裁切  【0~5】打星  {mark_part}  【长按右键】开镜  【Space】全屏"
+            )
+        stats_w = (self.lbl_dark_viewer_stats.sizeHint().width() + 24) if (
+            getattr(self, "lbl_dark_viewer_stats", None) and self.lbl_dark_viewer_stats.isVisible()
+        ) else 0
+        fm = QFontMetrics(self.lbl_viewer_hint.font())
+        self.lbl_viewer_hint.setText(fm.elidedText(txt, Qt.ElideRight, max(120, self.width() - 48 - stats_w)))
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._relayout_overlays()
+        QTimer.singleShot(0, self._relayout_overlays)
         self._clamp_pan_offset()
 
     def _on_viewer_filter_toggled(self, checked: bool):
@@ -2811,6 +2831,7 @@ class SinglePhotoViewer(QWidget):
         self.btn_compare.setStyleSheet(self._COMPARE_BTN_NORMAL)
         self.btn_cmp_left_next.setVisible(False)
         self.btn_cmp_right_prev.setVisible(False)
+        self.btn_compare_sync.setVisible(False)
         # 快捷键改绑后，进入检视器时按钮文案即时刷新
         sc = load_shortcuts()
         if not self.is_eye_zoom_mode:
@@ -2820,6 +2841,7 @@ class SinglePhotoViewer(QWidget):
         self.btn_af_toggle.setToolTip(f"对焦点显示 ({sc.get('af', 'F')})")
         self.btn_compare.setText("🆚 对比")
         self.btn_compare.setToolTip(f"对比模式 ({sc.get('compare', 'C')})")
+        self.btn_lock_viewport.setToolTip(f"放大切图锁定 ({sc.get('lock_viewport', 'V')})：切图保持当前放大倍率与位置")
         self.btn_grid_toggle.setToolTip(f"构图辅助线 ({sc.get('grid', 'Q')})")
         self.btn_crop_toggle.setToolTip(f"预裁剪交互模式 ({sc.get('precrop', 'W')})")
 
@@ -2941,7 +2963,7 @@ class SinglePhotoViewer(QWidget):
             if self.filmstrip_view.isVisible():
                 self.filmstrip_view.scrollTo(idx, QAbstractItemView.EnsureVisible)
 
-        # 【切图视口继承】：如果正处于特写模式，下一张照片瞬间自动对准该图双眼！
+        # 【切图视口继承】：特写模式自动锁瞳；锁视口模式保持手动放大倍率与位置
         if self.is_eye_zoom_mode:
             self._apply_eye_zoom()
         elif self.compare_mode:
@@ -2949,6 +2971,14 @@ class SinglePhotoViewer(QWidget):
             self._clamp_all_pans()
             self._sync_zoom_ui()
             self._refresh_active_pane_ui()
+            self.update()
+        elif self.lock_viewport_on_switch:
+            self._clamp_pan_offset()
+            self._sync_zoom_ui()
+            self._sync_minimap()
+            self.lbl_target_badge.setText(f"🔒 视口锁定 ({int(self.zoom_factor * 100)}%)")
+            self.lbl_target_badge.setStyleSheet("QLabel { background-color: #0c4a6e; color: #38bdf8; border: 1px solid #0284c7; border-radius: 2px; padding: 1px 6px; font-size: 11px; font-weight: 600; }")
+            self._relayout_overlays()
             self.update()
         else:
             self.zoom_factor = 1.0
@@ -3072,33 +3102,34 @@ class SinglePhotoViewer(QWidget):
         worker.start()
 
     def _apply_eye_zoom(self):
-        """视网膜自适应特写：精准绑定当前激活窗口，单格特写，绝不动另一格！"""
+        """视网膜自适应特写：对比非同步仅当前格；对比同步时左右同时锁瞳"""
         cur_path = self.get_active_path()
         if cur_path:
             self._trigger_raw_fusion_if_needed(cur_path)
 
         if self.compare_mode:
-            pane = self.active_pane
-            pr = self._pane_rect(pane)
-            base_sz = self._get_pane_base_scaled_size(pane)
-            face = self.current_face_rect if pane == 0 else self.compare_face_rect
-            if face is not None and face.width() > 1e-4 and base_sz.width() > 0:
-                target_face_px = pr.width() * 0.58
-                current_face_px = face.width() * base_sz.width()
-                adaptive_zoom = target_face_px / max(current_face_px, 1.0)
-                pane_zoom = max(1.5, min(10.0, adaptive_zoom))
-            else:
-                pane_zoom = 2.5
+            target_panes = (0, 1) if self.compare_sync else (self.active_pane,)
+            for pane in target_panes:
+                pr = self._pane_rect(pane)
+                base_sz = self._get_pane_base_scaled_size(pane)
+                face = self.current_face_rect if pane == 0 else self.compare_face_rect
+                if face is not None and face.width() > 1e-4 and base_sz.width() > 0:
+                    target_face_px = pr.width() * 0.58
+                    current_face_px = face.width() * base_sz.width()
+                    adaptive_zoom = target_face_px / max(current_face_px, 1.0)
+                    pane_zoom = max(1.5, min(10.0, adaptive_zoom))
+                else:
+                    pane_zoom = 2.5
 
-            self._set_pane_zoom(pane, pane_zoom)
-            self._set_pane_eye_zoom(pane, True)
+                self._set_pane_zoom(pane, pane_zoom)
+                self._set_pane_eye_zoom(pane, True)
 
-            bs = self._get_pane_base_scaled_size(pane)
-            nx, ny = self.current_target_norm if pane == 0 else self.compare_target_norm
-            draw_w = bs.width() * pane_zoom
-            draw_h = bs.height() * pane_zoom
-            self._set_pane_pan(pane, QPointF((0.5 - nx) * draw_w, (0.5 - ny) * draw_h))
-            self._clamp_pane_pan(pane)
+                bs = self._get_pane_base_scaled_size(pane)
+                nx, ny = self.current_target_norm if pane == 0 else self.compare_target_norm
+                draw_w = bs.width() * pane_zoom
+                draw_h = bs.height() * pane_zoom
+                self._set_pane_pan(pane, QPointF((0.5 - nx) * draw_w, (0.5 - ny) * draw_h))
+                self._clamp_pane_pan(pane)
             self._sync_zoom_ui()
             self._sync_eye_zoom_ui()
             self.update()
@@ -3124,13 +3155,14 @@ class SinglePhotoViewer(QWidget):
             self.update()
 
     def _reset_to_fit(self):
-        """退出特写，还原适配全景（对比模式下仅还原当前激活窗口）"""
+        """退出特写，还原适配全景（对比同步模式下左右一并还原）"""
         if self.compare_mode:
-            pane = self.active_pane
-            self._set_pane_zoom(pane, 1.0)
-            self._set_pane_eye_zoom(pane, False)
-            self._set_pane_pan(pane, QPointF(0, 0))
-            self._clamp_pane_pan(pane)
+            target_panes = (0, 1) if self.compare_sync else (self.active_pane,)
+            for pane in target_panes:
+                self._set_pane_zoom(pane, 1.0)
+                self._set_pane_eye_zoom(pane, False)
+                self._set_pane_pan(pane, QPointF(0, 0))
+                self._clamp_pane_pan(pane)
             self._sync_zoom_ui()
             self._sync_eye_zoom_ui()
             self.update()
@@ -3143,6 +3175,35 @@ class SinglePhotoViewer(QWidget):
             self._sync_minimap()
             self._sync_eye_zoom_ui()
             self.update()
+
+    def _toggle_compare_sync(self):
+        """对比模式：开关左右窗格锁定同步"""
+        self.compare_sync = not self.compare_sync
+        if self.compare_sync:
+            self.btn_compare_sync.setText("🔗 已同步")
+            self.btn_compare_sync.setStyleSheet(self._SYNC_BTN_ACTIVE)
+            if self.compare_mode:
+                src = self.active_pane
+                dst = 1 - src
+                self._set_pane_zoom(dst, self._pane_zoom(src))
+                src_pan = self.compare_pan_offset if src == 1 else self.pan_offset
+                self._set_pane_pan(dst, src_pan)
+                self._clamp_pane_pan(dst)
+                self._sync_zoom_ui()
+                self.update()
+        else:
+            self.btn_compare_sync.setText("🔗 同步")
+            self.btn_compare_sync.setStyleSheet(self._SYNC_BTN_NORMAL)
+
+    def _toggle_lock_viewport(self):
+        """放大切图锁定：切图时保持当前手动放大倍率与平移位置"""
+        self.lock_viewport_on_switch = not self.lock_viewport_on_switch
+        if self.lock_viewport_on_switch:
+            self.btn_lock_viewport.setText("🔒 锁视口")
+            self.btn_lock_viewport.setStyleSheet(self._LOCK_VP_ACTIVE)
+        else:
+            self.btn_lock_viewport.setText("🔓 锁视口")
+            self.btn_lock_viewport.setStyleSheet(self._LOCK_VP_NORMAL)
 
     def _toggle_eye_zoom(self):
         """特写开关：依据当前激活窗格的倍率独立切换特写/还原"""
@@ -3164,14 +3225,20 @@ class SinglePhotoViewer(QWidget):
             return self.photo_list[idx]
         return ""
 
+    def _view_height(self) -> int:
+        """照片可用视口高度：非全屏时扣除底部 30px 底栏，绝不挡图"""
+        hint_h = 30 if getattr(self, "viewer_bottom_bar", None) and self.viewer_bottom_bar.isVisible() else 0
+        return max(1, self.height() - hint_h)
+
     def _pane_rect(self, pane: int) -> QRectF:
-        """窗格几何：普通模式=整个视口；对比模式 0=左半 1=右半"""
+        """窗格几何：普通模式=可用视口；对比模式 0=左半 1=右半"""
+        vh = self._view_height()
         if not self.compare_mode:
-            return QRectF(self.rect())
+            return QRectF(0, 0, self.width(), vh)
         half = self.width() // 2
         if pane == 0:
-            return QRectF(0, 0, half, self.height())
-        return QRectF(half, 0, self.width() - half, self.height())
+            return QRectF(0, 0, half, vh)
+        return QRectF(half, 0, self.width() - half, vh)
 
     def _pane_pixmap(self, pane: int) -> QPixmap:
         return self.compare_pixmap if (self.compare_mode and pane == 1) else self.current_pixmap
@@ -3263,11 +3330,16 @@ class SinglePhotoViewer(QWidget):
             self._clamp_pane_pan(1)
 
     def _route_pan_delta(self, delta: QPointF):
-        """位移路由：对比模式下严格物理隔离，只移动当前激活/交互的窗格，杜绝任何联动！"""
+        """位移路由：对比模式非同步时物理隔离；开启同步时左右同步平移"""
         if self.compare_mode:
-            pan = QPointF(self.compare_pan_offset if self.active_pane == 1 else self.pan_offset)
-            self._set_pane_pan(self.active_pane, pan + delta)
-            self._clamp_pane_pan(self.active_pane)
+            if self.compare_sync:
+                self.pan_offset += delta
+                self.compare_pan_offset += delta
+                self._clamp_all_pans()
+            else:
+                pan = QPointF(self.compare_pan_offset if self.active_pane == 1 else self.pan_offset)
+                self._set_pane_pan(self.active_pane, pan + delta)
+                self._clamp_pane_pan(self.active_pane)
         else:
             self.pan_offset += delta
             self._clamp_pan_offset()
@@ -3302,6 +3374,10 @@ class SinglePhotoViewer(QWidget):
             self.compare_pan_offset = QPointF(self.pan_offset)
             self.btn_compare.setText("🆚 退出对比")
             self.btn_compare.setStyleSheet(self._COMPARE_BTN_ACTIVE)
+            self.btn_compare_sync.setVisible(True)
+            if self.compare_sync:
+                self.compare_zoom_factor = self.zoom_factor
+                self.compare_pan_offset = QPointF(self.pan_offset)
             self.minimap.setVisible(False)
             show_arrows = not self.is_pure_fullscreen
             self.btn_cmp_left_next.setVisible(show_arrows)
@@ -3315,6 +3391,7 @@ class SinglePhotoViewer(QWidget):
             self.compare_mode = False
             self.btn_compare.setText("🆚 对比")
             self.btn_compare.setStyleSheet(self._COMPARE_BTN_NORMAL)
+            self.btn_compare_sync.setVisible(False)
             self.minimap.setVisible(not self.is_pure_fullscreen or self.zoom_factor > 1.05)
             self.btn_cmp_left_next.setVisible(False)
             self.btn_cmp_right_prev.setVisible(False)
@@ -3358,8 +3435,10 @@ class SinglePhotoViewer(QWidget):
             self.compare_target_desc = loc_res.get("target_desc", "画面中心")
             self.compare_face_rect = loc_res["debug_face_rect"]
 
-        if not self.is_eye_zoom_mode:
+        if not self.is_eye_zoom_mode and not self.lock_viewport_on_switch and not self.compare_sync:
+            self.compare_zoom_factor = 1.0
             self.compare_pan_offset = QPointF(0, 0)
+
 
     def _on_edge_prev(self):
         """左边缘 ‹：对比模式=左格上一张；普通模式=主照片上一张"""
@@ -3483,8 +3562,10 @@ class SinglePhotoViewer(QWidget):
 
     def set_pure_fullscreen_mode(self, is_pure: bool):
         self.is_pure_fullscreen = is_pure
-        for w in [self.btn_back, self.lbl_filename, self.lbl_target_badge, self.zoom_box, self.tool_box, self.filmstrip_view, self.star_bar]:
+        for w in [self.btn_back, self.lbl_filename, self.lbl_target_badge, self.zoom_box, self.tool_box, self.filmstrip_view, self.star_bar, self.viewer_bottom_bar]:
             w.setVisible(not is_pure)
+        if not is_pure:
+            self._relayout_overlays()
 
         has_multiple = len(self.photo_list) > 1
         self.btn_prev.setVisible(has_multiple and not is_pure)
@@ -3579,7 +3660,7 @@ class SinglePhotoViewer(QWidget):
     def _get_base_scaled_size(self) -> QSizeF:
         if self.current_pixmap.isNull():
             return QSizeF(0, 0)
-        win_w, win_h = self.width(), self.height()
+        win_w, win_h = self.width(), self._view_height()
         pix_w, pix_h = self.current_pixmap.width(), self.current_pixmap.height()
         scale = min(win_w / pix_w, win_h / pix_h)
         return QSizeF(pix_w * scale, pix_h * scale)
@@ -3602,7 +3683,8 @@ class SinglePhotoViewer(QWidget):
         draw_w = base_sz.width() * self.zoom_factor
         draw_h = base_sz.height() * self.zoom_factor
 
-        win_w, win_h = self.width(), self.height()
+        win_w, win_h = self.width(), self._view_height()
+        painter.setClipRect(0, 0, win_w, win_h)
         draw_x = (win_w - draw_w) / 2.0 + self.pan_offset.x()
         draw_y = (win_h - draw_h) / 2.0 + self.pan_offset.y()
 
@@ -3800,7 +3882,7 @@ class SinglePhotoViewer(QWidget):
             return
 
         base_sz = self._get_base_scaled_size()
-        win_w, win_h = self.width(), self.height()
+        win_w, win_h = self.width(), self._view_height()
         if base_sz.width() <= 0 or base_sz.height() <= 0:
             return
 
@@ -3835,42 +3917,56 @@ class SinglePhotoViewer(QWidget):
         self.update()
 
     def _zoom_compare_at_cursor(self, pane: int, cursor_pos: QPointF, multiplier: float):
-        """对比模式：以当前光标在窗格中的像素点为锚点独立缩放，绝不影响另一格！"""
-        old_zoom = self._pane_zoom(pane)
-        new_zoom = max(0.75, min(10.0, old_zoom * multiplier))
-        if abs(new_zoom - old_zoom) < 1e-4:
-            return
+        """对比模式：以当前光标在窗格中的像素点为锚点缩放；开启同步时另一侧按同位置等比同步"""
+        target_panes = (0, 1) if self.compare_sync else (pane,)
+        ref_pr = self._pane_rect(pane)
+        any_changed = False
 
-        pr = self._pane_rect(pane)
-        base_sz = self._get_pane_base_scaled_size(pane)
-        if base_sz.width() <= 0 or base_sz.height() <= 0:
-            return
+        for p in target_panes:
+            old_zoom = self._pane_zoom(p)
+            new_zoom = max(0.75, min(10.0, old_zoom * multiplier))
+            if abs(new_zoom - old_zoom) < 1e-4:
+                continue
 
-        old_draw_w = base_sz.width() * old_zoom
-        old_draw_h = base_sz.height() * old_zoom
-        new_draw_w = base_sz.width() * new_zoom
-        new_draw_h = base_sz.height() * new_zoom
+            pr = self._pane_rect(p)
+            base_sz = self._get_pane_base_scaled_size(p)
+            if base_sz.width() <= 0 or base_sz.height() <= 0:
+                continue
 
-        pan = self.compare_pan_offset if pane == 1 else self.pan_offset
-        old_draw_x = pr.x() + (pr.width() - old_draw_w) / 2.0 + pan.x()
-        old_draw_y = pr.y() + (pr.height() - old_draw_h) / 2.0 + pan.y()
+            # 若是同步带动另一格，把光标映射到另一格相同相对坐标
+            p_cursor = cursor_pos if p == pane else QPointF(
+                pr.x() + (cursor_pos.x() - ref_pr.x()),
+                cursor_pos.y()
+            )
 
-        factor = new_zoom / old_zoom
+            old_draw_w = base_sz.width() * old_zoom
+            old_draw_h = base_sz.height() * old_zoom
+            new_draw_w = base_sz.width() * new_zoom
+            new_draw_h = base_sz.height() * new_zoom
 
-        if new_zoom <= 1.01:
-            new_pan_x = 0.0
-            new_pan_y = 0.0
-        else:
-            new_draw_x = cursor_pos.x() - (cursor_pos.x() - old_draw_x) * factor
-            new_draw_y = cursor_pos.y() - (cursor_pos.y() - old_draw_y) * factor
-            new_pan_x = new_draw_x - pr.x() - (pr.width() - new_draw_w) / 2.0
-            new_pan_y = new_draw_y - pr.y() - (pr.height() - new_draw_h) / 2.0
+            pan = self.compare_pan_offset if p == 1 else self.pan_offset
+            old_draw_x = pr.x() + (pr.width() - old_draw_w) / 2.0 + pan.x()
+            old_draw_y = pr.y() + (pr.height() - old_draw_h) / 2.0 + pan.y()
 
-        self._set_pane_zoom(pane, new_zoom)
-        self._set_pane_pan(pane, QPointF(new_pan_x, new_pan_y))
-        self._clamp_pane_pan(pane)
-        self._sync_zoom_ui()
-        self.update()
+            factor = new_zoom / old_zoom
+
+            if new_zoom <= 1.01:
+                new_pan_x = 0.0
+                new_pan_y = 0.0
+            else:
+                new_draw_x = p_cursor.x() - (p_cursor.x() - old_draw_x) * factor
+                new_draw_y = p_cursor.y() - (p_cursor.y() - old_draw_y) * factor
+                new_pan_x = new_draw_x - pr.x() - (pr.width() - new_draw_w) / 2.0
+                new_pan_y = new_draw_y - pr.y() - (pr.height() - new_draw_h) / 2.0
+
+            self._set_pane_zoom(p, new_zoom)
+            self._set_pane_pan(p, QPointF(new_pan_x, new_pan_y))
+            self._clamp_pane_pan(p)
+            any_changed = True
+
+        if any_changed:
+            self._sync_zoom_ui()
+            self.update()
 
     # 兼容层：保障滑块与所有预设菜单正常调用
     def _zoom_at_point(self, cursor_pos: QPointF, multiplier: float):
@@ -3883,7 +3979,7 @@ class SinglePhotoViewer(QWidget):
         self._zoom_compare_at_cursor(self.active_pane, cursor_pos, multiplier)
 
     def _zoom_at_center(self, multiplier: float):
-        center_pt = QPointF(self.width() / 2.0, self.height() / 2.0)
+        center_pt = QPointF(self.width() / 2.0, self._view_height() / 2.0)
         self._zoom_at_cursor(center_pt, multiplier)
 
     def _zoom_compare_center(self, pane: int, multiplier: float):
@@ -3899,7 +3995,7 @@ class SinglePhotoViewer(QWidget):
             pr = self._pane_rect(self.active_pane)
             self._zoom_compare_at_cursor(self.active_pane, pr.center(), multiplier)
         else:
-            center_pt = QPointF(self.width() / 2.0, self.height() / 2.0)
+            center_pt = QPointF(self.width() / 2.0, self._view_height() / 2.0)
             self._zoom_at_cursor(center_pt, multiplier)
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -3910,7 +4006,7 @@ class SinglePhotoViewer(QWidget):
                 draw_w = base_sz.width() * self.zoom_factor
                 draw_h = base_sz.height() * self.zoom_factor
                 draw_x = (self.width() - draw_w) / 2.0 + self.pan_offset.x()
-                draw_y = (self.height() - draw_h) / 2.0 + self.pan_offset.y()
+                draw_y = (self._view_height() - draw_h) / 2.0 + self.pan_offset.y()
                 draw_rect = QRectF(draw_x, draw_y, draw_w, draw_h)
                 crop_rect = self._get_current_crop_pixel_rect(draw_rect)
 
@@ -4174,6 +4270,7 @@ class SinglePhotoViewer(QWidget):
         k_cmp = shortcut_qt_key(sc["compare"])
         k_grid = shortcut_qt_key(sc.get("grid", "Q"))
         k_crop = shortcut_qt_key(sc.get("precrop", "W"))
+        k_trash = shortcut_qt_key(sc.get("trash", "G"))
 
         k_cmp_l_prev = shortcut_qt_key(sc.get("cmp_l_prev", "U"))
         k_cmp_l_next = shortcut_qt_key(sc.get("cmp_l_next", "I"))
@@ -4231,8 +4328,8 @@ class SinglePhotoViewer(QWidget):
         elif key == k_next:
             self.next_image()
             event.accept()
-        # 暗房模式下按下 Backspace，一键丢入废片篓
-        elif key == Qt.Key_Backspace and self.is_darkroom:
+        # 暗房模式下按下 G (可改绑) 或 Backspace，一键丢入废片篓
+        elif key in (k_trash, Qt.Key_Backspace) and self.is_darkroom:
             self._on_throw_trash_clicked()
             event.accept()
             return
@@ -4258,6 +4355,9 @@ class SinglePhotoViewer(QWidget):
             event.accept()
         elif key == k_crop:
             self._toggle_crop_active()
+            event.accept()
+        elif key == k_lock_vp:
+            self._toggle_lock_viewport()
             event.accept()
         # 空格键：绑定沉浸全屏 开/关！
         elif key == Qt.Key_Space:
@@ -4294,7 +4394,7 @@ class SinglePhotoViewer(QWidget):
         draw_w = base_sz.width() * self.zoom_factor
         draw_h = base_sz.height() * self.zoom_factor
 
-        win_w, win_h = self.width(), self.height()
+        win_w, win_h = self.width(), self._view_height()
         draw_x = (win_w - draw_w) / 2.0 + self.pan_offset.x()
         draw_y = (win_h - draw_h) / 2.0 + self.pan_offset.y()
 
@@ -4311,7 +4411,7 @@ class SinglePhotoViewer(QWidget):
         draw_w = base_sz.width() * self.zoom_factor
         draw_h = base_sz.height() * self.zoom_factor
 
-        win_w, win_h = self.width(), self.height()
+        win_w, win_h = self.width(), self._view_height()
         target_x = -(norm_x * draw_w - win_w / 2.0)
         target_y = -(norm_y * draw_h - win_h / 2.0)
 
@@ -5402,9 +5502,9 @@ class AlbumPageWidget(QWidget):
 
         self.combo_sort = QComboBox()
         self.combo_sort.setMinimumWidth(150)
+        self.combo_sort.addItem("创建日期 (新→旧)", "mtime_desc")
+        self.combo_sort.addItem("创建日期 (旧→新)", "mtime_asc")
         self.combo_sort.addItem("文件名 (A→Z)", "name")
-        self.combo_sort.addItem("拍摄时间 (新→旧)", "mtime_desc")
-        self.combo_sort.addItem("拍摄时间 (旧→新)", "mtime_asc")
         self.combo_sort.addItem("文件大小 (大→小)", "size_desc")
         self.combo_sort.addItem("⭐ 打星优先 (高→低)", "rating")
         self.combo_sort.currentIndexChanged.connect(self._on_sort_or_filter_changed)
@@ -5417,6 +5517,18 @@ class AlbumPageWidget(QWidget):
         self.combo_filter.addItem("仅未打星", "unrated")
         self.combo_filter.currentIndexChanged.connect(self._on_sort_or_filter_changed)
         row2_gal.addWidget(self.combo_filter)
+
+        self.edit_search = QLineEdit()
+        self.edit_search.setPlaceholderText("🔍 搜索文件夹 / 文件名...")
+        self.edit_search.setClearButtonEnabled(True)
+        self.edit_search.setFixedWidth(190)
+        self.edit_search.setStyleSheet(
+            "QLineEdit { background-color: #121214; border: 1px solid #3f3f46; border-radius: 4px; "
+            "padding: 3px 8px; color: #f4f4f5; font-size: 12px; } "
+            "QLineEdit:focus { border: 1px solid #38bdf8; }"
+        )
+        self.edit_search.textChanged.connect(self._on_search_changed)
+        row2_gal.addWidget(self.edit_search)
 
         row2_gal.addStretch()
 
@@ -5444,7 +5556,7 @@ class AlbumPageWidget(QWidget):
         self.combo_format.blockSignals(False)
 
         self.combo_sort.blockSignals(True)
-        idx = self.combo_sort.findData(settings.value("album_sort_mode", "name"))
+        idx = self.combo_sort.findData(settings.value("album_sort_mode", "mtime_desc"))
         self.combo_sort.setCurrentIndex(max(0, idx))
         self.combo_sort.blockSignals(False)
         self.combo_filter.blockSignals(True)
@@ -5468,7 +5580,10 @@ class AlbumPageWidget(QWidget):
         b_layout = QHBoxLayout(bottom_bar)
         b_layout.setContentsMargins(12, 4, 12, 4)
 
-        lbl_hint = QLabel("💡 提示：双击进入大图检视；【R】特写；【Q】构图辅助；【W】裁切；【0~5】打星；【H】选入暗房")
+        lbl_hint = QLabel(
+            "💡 提示：双击打开文件夹 / 进大图；【Ctrl+滚轮】缩放缩略图；选择模式下【Ctrl+单击】单选，【Shift+单击】范围连选"
+        )
+        lbl_hint.setMinimumWidth(0)
         lbl_hint.setStyleSheet("color: #71717a; font-size: 11px;")
         b_layout.addWidget(lbl_hint)
 
@@ -5537,18 +5652,10 @@ class AlbumPageWidget(QWidget):
 
         # 左侧：正方形撑满高度的 "<" 返回按键
         self.row2_viewer_layout.addWidget(self.photo_viewer.btn_back)
-
-        # 避让左侧 250px 看板，把文件名精准往右推到照片视口中轴上方！
-        self.row2_viewer_layout.addSpacing(240)
-
-        # 弹性区 1
         self.row2_viewer_layout.addStretch(1)
 
-        # 中间：纯净文件名
-        self.row2_viewer_layout.addWidget(self.photo_viewer.lbl_filename)
-
-        # 弹性区 2：对称保持
-        self.row2_viewer_layout.addStretch(1)
+        # 文件名独立挂载到顶栏父容器，由 _relayout_overlays 按照片视口中轴线绝对居中
+        self.photo_viewer.lbl_filename.setParent(self.row2_viewer_box)
 
         # 右侧：方案 B 单排紧凑功能胶囊组 (高度 22px，水平无缝连排，彻底取代旧田字格)
         tool_capsule = QFrame()
@@ -5558,7 +5665,9 @@ class AlbumPageWidget(QWidget):
         tool_capsule_l.setSpacing(3)
         tool_capsule_l.addWidget(self.photo_viewer.btn_eye_zoom)
         tool_capsule_l.addWidget(self.photo_viewer.btn_af_toggle)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_lock_viewport)
         tool_capsule_l.addWidget(self.photo_viewer.btn_compare)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_compare_sync)
         tool_capsule_l.addWidget(self.photo_viewer.btn_grid_toggle)
         tool_capsule_l.addWidget(self.photo_viewer.btn_crop_toggle)
         tool_capsule_l.addWidget(self.photo_viewer.combo_crop_ratio)
@@ -5645,6 +5754,7 @@ class AlbumPageWidget(QWidget):
             _RAW_BUNDLE_CACHE.pop(file_path, None)
             if parse_photo_rating(file_path) == rating:
                 self.ratings[file_path] = rating
+                self._save_ratings_cache()
                 self.photo_viewer.update_rating_label(rating)
                 self._rebuild_photo_list()
                 self.gallery.viewport().update()
@@ -5730,6 +5840,7 @@ class AlbumPageWidget(QWidget):
 
         self.active_cache_dir = self._resolve_folder_cache_dir(p)
         self.gallery.delegate.clear_cache()
+        cached_ratings_map = self._load_ratings_cache(self.active_cache_dir)
 
         sub_dirs = []
         found_jpgs = []
@@ -5749,20 +5860,55 @@ class AlbumPageWidget(QWidget):
         self._sub_dirs = sub_dirs
         self._all_jpgs = found_jpgs
         self._all_raws = found_raws
+        if hasattr(self, "edit_search"):
+            self.edit_search.blockSignals(True)
+            self.edit_search.clear()
+            self.edit_search.blockSignals(False)
+
+        # 命中星级缓存：直接填入 self.ratings，不用重新扫原图文件头
+        all_found = found_jpgs + found_raws
+        valid_meta_paths = set()
+        for fp in all_found:
+            try:
+                mt = os.path.getmtime(fp)
+            except OSError:
+                continue
+            rec = cached_ratings_map.get(fp)
+            if isinstance(rec, list) and len(rec) == 2 and rec[0] == mt:
+                self.ratings[fp] = int(rec[1])
+                valid_meta_paths.add(fp)
+
         self._rebuild_photo_list()
 
         if not self.photos:
             self.page_stack.setCurrentIndex(0)
             return
 
+        # 统计已有多少张图命中 .cache：超过一半已缓存就直接展示画廊后台秒贴，不再卡进度条
+        cached_hits = 0
+        for fp in self.photos:
+            try:
+                mt = os.path.getmtime(fp)
+                ck = hashlib.md5(f"{fp}_{mt}".encode("utf-8")).hexdigest()
+                if (self.active_cache_dir / f"{ck}.jpg").exists():
+                    cached_hits += 1
+            except OSError:
+                pass
+        has_warm_cache = cached_hits > 0 and cached_hits >= (len(self.photos) // 2)
+
         self.warmup_total = len(self.photos)
         self.warmup_finished_count = 0
         self._warmup_done_fired = False
-        _crashlog(f"[album] load_folder {p} 共{len(self.photos)}张")
-        self.progress_loading.setValue(0)
-        self.lbl_loading_detail.setText(f"预热进度: 0 / {self.warmup_total} (0%)")
-        self.page_stack.setCurrentIndex(1)
-        self.btn_open.setEnabled(False)
+        _crashlog(f"[album] load_folder {p} 共{len(self.photos)}张 (命中缓存{cached_hits}张)")
+
+        if has_warm_cache:
+            self.page_stack.setCurrentIndex(0)
+            self.btn_open.setEnabled(True)
+        else:
+            self.progress_loading.setValue(0)
+            self.lbl_loading_detail.setText(f"预热进度: 0 / {self.warmup_total} (0%)")
+            self.page_stack.setCurrentIndex(1)
+            self.btn_open.setEnabled(False)
 
         thread_pool = QThreadPool.globalInstance()
         thread_pool.setMaxThreadCount(min(6, os.cpu_count() or 4))
@@ -5775,7 +5921,8 @@ class AlbumPageWidget(QWidget):
         # 两边抢一个对象就是随机 access violation。挂引用 + 手动管生命周期，done 后才释放。
         self._live_thumb_tasks = set()
         for photo_path in self.photos:
-            task = ThumbnailTask(photo_path, self.active_cache_dir, provisional_ok=True)
+            skip_meta = photo_path in valid_meta_paths
+            task = ThumbnailTask(photo_path, self.active_cache_dir, provisional_ok=True, skip_meta=skip_meta)
             task.setAutoDelete(False)
             self._live_thumb_tasks.add(task)
             task.signals.loaded.connect(self._on_single_thumb_cached)
@@ -5784,6 +5931,34 @@ class AlbumPageWidget(QWidget):
             task.signals.provisional_used.connect(self._on_provisional_used)
             task.signals.task_done.connect(lambda p, t=task: QTimer.singleShot(200, lambda: self._live_thumb_tasks.discard(t)))
             thread_pool.start(task)
+
+    def _load_ratings_cache(self, cache_dir: Path) -> dict:
+        if not cache_dir:
+            return {}
+        rf = cache_dir / "ratings_cache.json"
+        if not rf.exists():
+            return {}
+        try:
+            data = json.loads(rf.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_ratings_cache(self):
+        if not self.active_cache_dir:
+            return
+        rf = self.active_cache_dir / "ratings_cache.json"
+        payload = {}
+        for fp in (self._all_jpgs + self._all_raws):
+            if fp in self.ratings:
+                try:
+                    payload[fp] = [os.path.getmtime(fp), int(self.ratings[fp])]
+                except OSError:
+                    pass
+        try:
+            rf.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
     def _on_provisional_used(self, file_path: str):
         self._provisional_pending.add(file_path)
@@ -5824,6 +5999,7 @@ class AlbumPageWidget(QWidget):
         if self.warmup_finished_count >= self.warmup_total and not getattr(self, "_warmup_done_fired", False):
             self._warmup_done_fired = True
             _crashlog(f"[album] 预热完成，待升级 {len(self._provisional_pending)} 张")
+            self._save_ratings_cache()
             self.page_stack.setCurrentIndex(0)
             self.btn_open.setEnabled(True)
             self._rebuild_photo_list()   # 打星全部就位，统一刷新排序与统计
@@ -5840,10 +6016,14 @@ class AlbumPageWidget(QWidget):
         self._rebuild_photo_list()
         self.gallery.viewport().update()
 
+    def _on_search_changed(self):
+        self._rebuild_photo_list()
+        self.gallery.viewport().update()
+
     def _rebuild_photo_list(self):
-        """统一重建: 格式分流 -> 过滤 (打星) -> 排序 -> 刷新模型与统计"""
+        """统一重建: 格式分流 -> 过滤 (打星/关键词搜索) -> 排序 (统一创建日期) -> 刷新模型与统计"""
         fmt_mode = self.combo_format.currentData() if hasattr(self, 'combo_format') else "jpg"
-        sort_mode = self.combo_sort.currentData() if hasattr(self, 'combo_sort') else "name"
+        sort_mode = self.combo_sort.currentData() if hasattr(self, 'combo_sort') else "mtime_desc"
         filter_mode = self.combo_filter.currentData() if hasattr(self, 'combo_filter') else "all"
 
         if fmt_mode == "raw":
@@ -5859,32 +6039,42 @@ class AlbumPageWidget(QWidget):
         elif filter_mode == "unrated":
             photos = [p for p in photos if self.ratings.get(p, 0) <= 0]
 
-# 文件夹与照片同步参与多维排序
         sub_dirs = list(self._sub_dirs)
+        kw = self.edit_search.text().strip().lower() if hasattr(self, 'edit_search') else ""
+        if kw:
+            sub_dirs = [d for d in sub_dirs if kw in Path(d).name.lower()]
+            photos = [p for p in photos if kw in Path(p).name.lower()]
 
-        def _dir_mtime(d):
+        def _ctime(p):
             try:
-                return os.path.getmtime(d)
+                return os.path.getctime(p)
             except OSError:
                 return 0.0
 
+        def _fsize(p):
+            try:
+                return os.path.getsize(p)
+            except OSError:
+                return 0
+
+        def _nat_key(p):
+            return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', Path(p).name)]
+
         if sort_mode == "mtime_desc":
-            sub_dirs.sort(key=_dir_mtime, reverse=True)
-            photos.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            sub_dirs.sort(key=_ctime, reverse=True)
+            photos.sort(key=_ctime, reverse=True)
         elif sort_mode == "mtime_asc":
-            sub_dirs.sort(key=_dir_mtime)
-            photos.sort(key=lambda p: os.path.getmtime(p))
+            sub_dirs.sort(key=_ctime)
+            photos.sort(key=_ctime)
         elif sort_mode == "size_desc":
-            # 文件夹按最新时间优先置顶，照片按物理字节大小倒序
-            sub_dirs.sort(key=_dir_mtime, reverse=True)
-            photos.sort(key=lambda p: os.path.getsize(p), reverse=True)
+            sub_dirs.sort(key=_ctime, reverse=True)
+            photos.sort(key=_fsize, reverse=True)
         elif sort_mode == "rating":
-            # 文件夹按名称置顶，照片按星级高低倒序
-            sub_dirs.sort(key=lambda d: Path(d).name.lower())
-            photos.sort(key=lambda p: (-self.ratings.get(p, 0), Path(p).name.lower()))
+            sub_dirs.sort(key=_nat_key)
+            photos.sort(key=lambda p: (-self.ratings.get(p, 0), _nat_key(p)))
         else:
-            sub_dirs.sort(key=lambda d: Path(d).name.lower())
-            photos.sort(key=lambda s: Path(s).name.lower())
+            sub_dirs.sort(key=_nat_key)
+            photos.sort(key=_nat_key)
 
         self.photos = photos
         all_items = [(d, True) for d in sub_dirs] + [(f, False) for f in photos]
@@ -6088,14 +6278,12 @@ class DarkroomPageWidget(QWidget):
 
         # 左侧：正方形撑满高度的物理返回按键 "<"
         self.viewer_layout.addWidget(self.photo_viewer.btn_back)
-
-        # 避让左侧 250px 看板，中轴绝对对称
-        self.viewer_layout.addSpacing(240)
-        self.viewer_layout.addStretch(1)
-        self.viewer_layout.addWidget(self.photo_viewer.lbl_filename)
         self.viewer_layout.addStretch(1)
 
-        # 右侧：满血接回胶囊工具组 (特写 / 对焦 / 对比 / 锁瞳徽标)
+        # 文件名独立挂载到顶栏父容器，由 _relayout_overlays 按照片视口中轴线绝对居中
+        self.photo_viewer.lbl_filename.setParent(self.viewer_bar)
+
+        # 右侧：满血接回胶囊工具组 (特写 / 对焦 / 对比 / 同步 / 锁视口 / 构图 / 裁切 / 锁瞳徽标)
         tool_capsule = QFrame()
         tool_capsule.setStyleSheet("QFrame { background-color: #18181c; border: 1px solid #2e2e36; border-radius: 3px; }")
         tool_capsule_l = QHBoxLayout(tool_capsule)
@@ -6103,7 +6291,9 @@ class DarkroomPageWidget(QWidget):
         tool_capsule_l.setSpacing(3)
         tool_capsule_l.addWidget(self.photo_viewer.btn_eye_zoom)
         tool_capsule_l.addWidget(self.photo_viewer.btn_af_toggle)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_lock_viewport)
         tool_capsule_l.addWidget(self.photo_viewer.btn_compare)
+        tool_capsule_l.addWidget(self.photo_viewer.btn_compare_sync)
         tool_capsule_l.addWidget(self.photo_viewer.btn_grid_toggle)
         tool_capsule_l.addWidget(self.photo_viewer.btn_crop_toggle)
         tool_capsule_l.addWidget(self.photo_viewer.combo_crop_ratio)
@@ -6133,13 +6323,17 @@ class DarkroomPageWidget(QWidget):
         bot_layout = QHBoxLayout(bottom_bar)
         bot_layout.setContentsMargins(12, 4, 12, 4)
 
-        _mk = load_shortcuts()['mark']
         if self.cull_mode == "pick":
-            hint_str = f"💡 提示：当前为【暗片挑好片】模式；按 {_mk} 点亮好片；未点亮的暗片不参与导出"
+            hint_str = (
+                "💡 暗片挑好片：双击进大图；点击右上角【＋/★】点亮好片；【Ctrl+滚轮】缩放缩略图；批量移出时【Shift+单击】范围连选"
+            )
         else:
-            hint_str = f"💡 提示：当前为【亮片踢废片】模式；按 {_mk} 压暗隐藏废片；被压暗的废片不参与导出"
+            hint_str = (
+                "💡 亮片踢废片：双击进大图；点击右上角【👁/✕】隐藏废片；【Ctrl+滚轮】缩放缩略图；批量移出时【Shift+单击】范围连选"
+            )
 
         lbl_hint = QLabel(hint_str)
+        lbl_hint.setMinimumWidth(0)
         lbl_hint.setStyleSheet("color: #71717a; font-size: 11px;")
         bot_layout.addWidget(lbl_hint)
 
@@ -6362,6 +6556,9 @@ class DarkroomPageWidget(QWidget):
             if delegate.is_remove_mode:
                 cnt = len(delegate.remove_set)
                 self.btn_remove_mode.setText(f"✕ 确认丢入废片篓 ({cnt})" if cnt > 0 else "✕ 确认丢入废片篓")
+
+        if hasattr(self, "photo_viewer"):
+            self.photo_viewer.set_darkroom_stats(self.lbl_dark_stats.text())
 
         self.gallery.viewport().update()
         self._save_session()

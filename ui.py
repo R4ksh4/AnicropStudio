@@ -958,7 +958,11 @@ class SettingsPageWidget(QWidget):
         about_layout.setSpacing(12)
         about_layout.setContentsMargins(16, 18, 16, 16)
 
-        lbl_app_info = QLabel("Anicrop Studio (Beta 4.1.0)")
+        try:
+            from main import APP_VERSION
+        except Exception:
+            APP_VERSION = "Beta 4.2.0"
+        lbl_app_info = QLabel(f"Anicrop Studio ({APP_VERSION})")
         lbl_app_info.setStyleSheet("font-size: 15px; font-weight: bold; color: #38bdf8;")
         about_layout.addWidget(lbl_app_info)
 
@@ -1188,7 +1192,11 @@ class SettingsPageWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Anicrop Studio - 二次元漫展返图流极客工作台 [Beta 4.1.0]")
+        try:
+            from main import APP_VERSION
+        except Exception:
+            APP_VERSION = "Beta 4.2.0"
+        self.setWindowTitle(f"Anicrop Studio - 二次元漫展返图流极客工作台 [{APP_VERSION}]")
         self.resize(1320, 880)
         self.setMinimumSize(1024, 720)
         self.setStyleSheet(DARK_STYLE_SHEET)
@@ -1232,16 +1240,16 @@ class MainWindow(QMainWindow):
         self.btn_tab_darkroom.clicked.connect(lambda: self._switch_tab(1))
         top_nav_layout.addWidget(self.btn_tab_darkroom)
 
-        self.btn_tab_watermark = QPushButton("🏷️ 参数画框水印")
-        self.btn_tab_watermark.setProperty("class", "NavTab")
-        self.btn_tab_watermark.clicked.connect(lambda: self._switch_tab(2))
-        top_nav_layout.addWidget(self.btn_tab_watermark)
-
         self.btn_tab_inpaint = QPushButton("🪄 AI 魔法消除")
         self.btn_tab_inpaint.setProperty("class", "NavTab")
         self.btn_tab_inpaint.setToolTip("AI 网页背景修补 + 原图无损缝合的魔法消除工作台")
-        self.btn_tab_inpaint.clicked.connect(lambda: self._switch_tab(3))
+        self.btn_tab_inpaint.clicked.connect(lambda: self._switch_tab(2))
         top_nav_layout.addWidget(self.btn_tab_inpaint)
+
+        self.btn_tab_watermark = QPushButton("🏷️ 参数画框水印")
+        self.btn_tab_watermark.setProperty("class", "NavTab")
+        self.btn_tab_watermark.clicked.connect(lambda: self._switch_tab(3))
+        top_nav_layout.addWidget(self.btn_tab_watermark)
 
         self.btn_tab_airlink = QPushButton("📡 隔空极速快传")
         self.btn_tab_airlink.setProperty("class", "NavTab")
@@ -1374,14 +1382,14 @@ class MainWindow(QMainWindow):
         self.page_darkroom.sig_return_to_gallery.connect(lambda: self._switch_tab(0))
         self.stack.addWidget(self.page_darkroom)
 
-        # Page 2: 参数画框水印工作台 (独立模块)
-        self.page_watermark = WatermarkPageWidget()
-        self.stack.addWidget(self.page_watermark)
-
-        # Page 3: AI 魔法消除工作台 (挂载底图加载与 EXIF 看板联动)
+        # Page 2: AI 魔法消除工作台 (挂载底图加载与 EXIF 看板联动)
         self.page_inpaint = InpaintPageWidget()
         self.page_inpaint.sig_photo_loaded.connect(lambda p: self._on_photo_selected(p, 0, 1))
         self.stack.addWidget(self.page_inpaint)
+
+        # Page 3: 参数画框水印工作台 (独立模块)
+        self.page_watermark = WatermarkPageWidget()
+        self.stack.addWidget(self.page_watermark)
 
         # Page 4: 移动端局域极速快传站 (Air-Link 挂载点)
         self.page_airlink = AirLinkPageWidget()
@@ -1446,21 +1454,21 @@ class MainWindow(QMainWindow):
             self.toolbar_stack.setVisible(False)
 
         tabs = [
-            self.btn_tab_album, self.btn_tab_darkroom, self.btn_tab_watermark,
-            self.btn_tab_inpaint, self.btn_tab_airlink, self.btn_tab_settings
+            self.btn_tab_album, self.btn_tab_darkroom, self.btn_tab_inpaint,
+            self.btn_tab_watermark, self.btn_tab_airlink, self.btn_tab_settings
         ]
         for i, b in enumerate(tabs):
             b.setProperty("class", "NavTab NavTabActive" if i == index else "NavTab")
             b.style().polish(b)
 
         # 魔法消除模块同步放行点亮 EXIF 拍摄参数面板
-        self.exif_group.setVisible(index in (0, 1, 3))
+        self.exif_group.setVisible(index in (0, 1, 2))
 
         title_map = {
             0: "🖼️ 漫展画廊初筛",
             1: "🧪 极客暗房工坊",
-            2: "🏷️ 参数画框工作台",
-            3: "🪄 魔法消除工作台",
+            2: "🪄 魔法消除工作台",
+            3: "🏷️ 参数画框工作台",
             4: "📡 移动端隔空快传",
             5: "⚙️ 系统全局偏好"
         }

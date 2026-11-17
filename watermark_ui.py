@@ -1444,7 +1444,7 @@ class WatermarkPageWidget(QWidget):
 
             h2 = QHBoxLayout()
             h2.addWidget(QLabel("吸附:"))
-            combo_align = QComboBox()
+            combo_align = NoWheelComboBox()
             combo_align.addItem("左", "left")
             combo_align.addItem("中", "center")
             combo_align.addItem("右", "right")
@@ -1453,7 +1453,7 @@ class WatermarkPageWidget(QWidget):
             h2.addWidget(combo_align)
 
             h2.addWidget(QLabel("字体:"))
-            combo_font = QComboBox()
+            combo_font = NoWheelComboBox()
             combo_font.addItem("Segoe UI", "Segoe UI")
             combo_font.addItem("Consolas", "Consolas")
             combo_font.addItem("Arial", "Arial")
