@@ -1,10 +1,26 @@
 # -*- coding: utf-8 -*-
 import sys
+import os
+
+# 物理打通 Windows DLL 寻址链：让 ONNX 与 cuDNN 内部加载器同时吃进 CUDA/cuDNN 运行时
+for p in sys.path:
+    nv_dir = os.path.join(p, "nvidia")
+    if os.path.isdir(nv_dir):
+        for sub in os.listdir(nv_dir):
+            bin_dir = os.path.join(nv_dir, sub, "bin")
+            if os.path.isdir(bin_dir):
+                # 核心杀招：cuDNN 9 内部子引擎动态加载硬性依赖系统 PATH
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+                try:
+                    os.add_dll_directory(bin_dir)
+                except Exception:
+                    pass
+
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QSettings
 
 # 唯一全局版本号入口：以后发版只改这一行
-APP_VERSION = "Beta 4.2.0"
+APP_VERSION = "Beta 5.0.0"
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):

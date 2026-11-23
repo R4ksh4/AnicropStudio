@@ -19,3 +19,5 @@ assets/*.onnx
 # 4. 私人打包笔记与本地临时标注图
 打包.txt
 debug_annotated.jpg
+output/
+assets/logos/

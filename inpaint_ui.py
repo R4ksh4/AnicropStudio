@@ -15,7 +15,7 @@ import numpy as np
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QFrame, QSplitter, QMessageBox, QDialog,
-    QSlider, QComboBox, QFileDialog, QStackedWidget, QApplication
+    QSlider, QComboBox, QFileDialog, QStackedWidget, QApplication, QSpinBox, QColorDialog
 )
 from PySide6.QtCore import Qt, Signal, QUrl, QSettings, QPointF, QRectF, QThread, QTimer
 from PySide6.QtGui import (
@@ -37,10 +37,10 @@ except ImportError:
     HAS_WEBENGINE = False
 
 
-def imread_unicode(path: str) -> np.ndarray | None:
+def imread_unicode(path: str, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
     try:
         data = np.fromfile(path, dtype=np.uint8)
-        return cv2.imdecode(data, cv2.IMREAD_COLOR)
+        return cv2.imdecode(data, flags)
     except Exception:
         return None
 
@@ -89,10 +89,17 @@ def _extract_metadata_segments(src_path: str) -> list[bytes]:
 
 
 def imwrite_unicode(path: str, img: np.ndarray, quality: int = 95, orig_file_path: str = "") -> bool:
-    """满血图像写入引擎：支持 Unicode 路径并无损嫁接注入底图的 EXIF/XMP/ICC 元数据"""
+    """满血图像写入引擎：支持 Unicode 路径并无损嫁接注入底图的 EXIF/XMP/ICC 元数据（支持 BGRA 透明 PNG）"""
     try:
         ext = Path(path).suffix.lower()
         if ext in ('.jpg', '.jpeg'):
+            # 如果是 4 通道误存为 jpg，自动压成白底 3 通道防崩
+            if len(img.shape) == 3 and img.shape[2] == 4:
+                b, g, r, a = cv2.split(img)
+                alpha = a.astype(np.float32) / 255.0
+                bgr = cv2.merge([b, g, r]).astype(np.float32)
+                white = np.full_like(bgr, 255.0)
+                img = (bgr * alpha[:, :, np.newaxis] + white * (1.0 - alpha[:, :, np.newaxis])).astype(np.uint8)
             params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
         elif ext == '.png':
             params = [int(cv2.IMWRITE_PNG_COMPRESSION), 3]
@@ -104,12 +111,11 @@ def imwrite_unicode(path: str, img: np.ndarray, quality: int = 95, orig_file_pat
 
         data_bytes = buf.tobytes()
 
-        # 核心：对导出的 JPEG 注入底图完整的 EXIF/XMP/相机/镜头/ICC 广色域元数据
+        # 对导出的 JPEG 注入底图完整的 EXIF/XMP/相机/镜头/ICC 广色域元数据
         if ext in ('.jpg', '.jpeg') and orig_file_path:
             meta_segs = _extract_metadata_segments(orig_file_path)
             if meta_segs and len(data_bytes) >= 2 and data_bytes[:2] == b'\xff\xd8':
                 insert_pos = 2
-                # 若 OpenCV 生成了 APP0 (JFIF)，插在 APP0 之后，避免破坏解析结构
                 if len(data_bytes) > 4 and data_bytes[2:4] == b'\xff\xe0':
                     app0_len = int.from_bytes(data_bytes[4:6], 'big')
                     insert_pos = 2 + 2 + app0_len
@@ -142,6 +148,13 @@ def auto_align_patch(orig_bgr: np.ndarray, patch_bgr: np.ndarray) -> tuple[np.nd
 
     gray_orig = cv2.cvtColor(small_orig, cv2.COLOR_BGR2GRAY)
     gray_patch = cv2.cvtColor(small_patch, cv2.COLOR_BGR2GRAY)
+
+    # 剪影护栏：如果 AI 图是低饱和度的黑白剪影蒙版，跳过 SIFT 防止特征点不足导致 Homography 扭曲
+    hsv_p = cv2.cvtColor(small_patch, cv2.COLOR_BGR2HSV)
+    is_low_sat = float(np.mean(hsv_p[:, :, 1])) < 22.0
+    is_bimodal = float(np.mean((gray_patch < 55) | (gray_patch > 195))) > 0.70
+    if is_low_sat and is_bimodal:
+        return cv2.resize(patch_bgr, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4), True
 
     sift = cv2.SIFT_create(nfeatures=800)
     kp_orig, desc_orig = sift.detectAndCompute(gray_orig, None)
@@ -252,16 +265,221 @@ def fuse_generous_with_modnet(
     }
     return fused_bgr, total_inpaint_zone, stats
 
+def despill_green(bgr_img: np.ndarray) -> np.ndarray:
+    """达芬奇级消绿溢算子：彻底中和发丝边缘沾染的 AI 荧光绿，洗回自然发色"""
+    out = bgr_img.copy()
+    b = out[:, :, 0].astype(np.float32)
+    g = out[:, :, 1].astype(np.float32)
+    r = out[:, :, 2].astype(np.float32)
+
+    # 绿光上限绝不允许超过红蓝均值，溢出部分强行中和
+    rb_avg = (r + b) * 0.5
+    spill = g - rb_avg
+    mask_spill = spill > 0
+
+    g_corrected = np.where(mask_spill, rb_avg, g)
+    out[:, :, 1] = np.clip(g_corrected, 0, 255).astype(np.uint8)
+    return out
+
+def _guided_filter_edge(orig_bgr: np.ndarray, alpha_u8: np.ndarray, r: int = 4, eps: float = 0.002) -> np.ndarray:
+    """纯 OpenCV 高速导向滤波：把蒙版边缘自动吸附到原图真实物理轮廓上，消灭错位与锯齿"""
+    guide = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    p = alpha_u8.astype(np.float32) / 255.0
+    k = (2 * r + 1, 2 * r + 1)
+
+    mean_i = cv2.boxFilter(guide, cv2.CV_32F, k)
+    mean_p = cv2.boxFilter(p, cv2.CV_32F, k)
+    mean_ip = cv2.boxFilter(guide * p, cv2.CV_32F, k)
+    cov_ip = mean_ip - mean_i * mean_p
+
+    mean_ii = cv2.boxFilter(guide * guide, cv2.CV_32F, k)
+    var_i = mean_ii - mean_i * mean_i
+
+    a = cov_ip / (var_i + eps)
+    b = mean_p - a * mean_i
+
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, k)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, k)
+
+    q = mean_a * guide + mean_b
+    return np.clip(q * 255.0, 0, 255).astype(np.uint8)
+
+
+def extract_ai_cutout_alpha(patch_img: np.ndarray, subject_matte: np.ndarray, orig_bgr: np.ndarray = None) -> np.ndarray:
+    """
+    AI 纯色底蒙版提取器（外围连通域 + 封闭发缝平坦度探测 + 纯净边缘导向内收）
+    """
+    h, w = patch_img.shape[:2]
+
+    if len(patch_img.shape) == 3 and patch_img.shape[2] == 4:
+        raw_alpha = patch_img[:, :, 3]
+        if cv2.countNonZero(raw_alpha < 240) > (h * w * 0.05):
+            return raw_alpha
+
+    bgr = patch_img[:, :, :3]
+
+    # 0. 黑白剪影蒙版专线（支持带线稿防幻觉：只留外轮廓，内部线条全填实，外部杂线全清！）
+    gray_mat = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    hsv_mat = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    if float(np.mean(hsv_mat[:, :, 1])) < 22.0 and float(np.mean((gray_mat < 55) | (gray_mat > 195))) > 0.70:
+        edge_pixels = np.concatenate([
+            gray_mat[:15, :].ravel(),
+            gray_mat[-15:, :].ravel(),
+            gray_mat[:, :15].ravel(),
+            gray_mat[:, -15:].ravel()
+        ])
+        bg_lum = float(np.median(edge_pixels))
+        matte = (255.0 - gray_mat.astype(np.float32)) if bg_lum >= 128.0 else gray_mat.astype(np.float32)
+
+        # 1) 基础灰度色阶（保留外边缘丝滑抗锯齿）
+        alpha_raw = np.clip((matte - 105.0) / (215.0 - 105.0) * 255.0, 0.0, 255.0).astype(np.uint8)
+        fg_bin = (alpha_raw >= 128).astype(np.uint8)
+
+        # 2) 清理背景里孤立的散落杂线/噪点（只保留面积足够大的主体块）
+        min_fg_area = max(1000, int(h * w * 0.002))
+        n_fg, lbl_fg, stats_fg, _ = cv2.connectedComponentsWithStats(fg_bin, connectivity=4)
+        fg_clean = np.zeros_like(fg_bin)
+        for cid in range(1, n_fg):
+            if stats_fg[cid, cv2.CC_STAT_AREA] >= min_fg_area:
+                fg_clean[lbl_fg == cid] = 1
+
+        # 3) 只看外边缘，里面的线全部删掉（内部填实，仅保留纯白封闭发缝）
+        bg_inv = (1 - fg_clean).astype(np.uint8)
+        n_bg, lbl_bg, stats_bg, _ = cv2.connectedComponentsWithStats(bg_inv, connectivity=4)
+        border_bg = set(np.unique(np.concatenate([
+            lbl_bg[0, :], lbl_bg[-1, :], lbl_bg[:, 0], lbl_bg[:, -1]
+        ])).tolist())
+        true_bg = np.isin(lbl_bg, list(border_bg - {0}))
+
+        # 内部封闭空洞：只有面积>=250且极度纯白(matte均值<35)的才是真发缝，其余内部线条/五官/褶皱全填实！
+        for cid in range(1, n_bg):
+            if cid in border_bg:
+                continue
+            if stats_bg[cid, cv2.CC_STAT_AREA] >= 250:
+                bx, by, bw, bh = stats_bg[cid, :4]
+                sub_m = (lbl_bg[by:by + bh, bx:bx + bw] == cid)
+                if float(np.mean(matte[by:by + bh, bx:bx + bw][sub_m])) < 35.0:
+                    true_bg[by:by + bh, bx:bx + bw][sub_m] = True
+
+        fg_solid = np.where(true_bg, 0, 255).astype(np.uint8)
+
+        # 4) 仅在最外沿 2px 轮廓带继承平滑抗锯齿，内部 100% 实心、外部 0% 透明
+        k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        rim_band = (cv2.dilate(fg_solid, k5) > 0) & (cv2.erode(fg_solid, k5) == 0)
+        alpha_final = fg_solid.copy()
+        alpha_final[rim_band] = alpha_raw[rim_band]
+        return alpha_final
+
+    # 1. 四周边缘采样锁定背景基准色
+    samples = np.concatenate([
+        bgr[:15, :].reshape(-1, 3),
+        bgr[-15:, :].reshape(-1, 3),
+        bgr[:, :15].reshape(-1, 3),
+        bgr[:, -15:].reshape(-1, 3)
+    ], axis=0)
+    bg_color = np.median(samples, axis=0).astype(np.float32)
+
+    # 2. 计算色差
+    color_diff = np.linalg.norm(bgr.astype(np.float32) - bg_color, axis=2)
+
+    # 3. 外围连通域漫延：抓取与四边连通的所有外部背景
+    bg_cand = (color_diff < 24).astype(np.uint8)
+    _, labels = cv2.connectedComponents(bg_cand, connectivity=4)
+    border_labels = np.unique(np.concatenate([
+        labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]
+    ]))
+    border_labels = border_labels[border_labels > 0]
+    true_bg = np.isin(labels, border_labels).astype(np.uint8) * 255
+
+    '''# 4. 专杀封闭发缝：在内部未被连通的区域里，探测“极贴近纯灰底且画面平坦无笔触”的封闭发缝
+    gray_p = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    grad_abs = np.abs(cv2.Laplacian(gray_p, cv2.CV_16S))
+    strict_inner = ((color_diff < 12) & (true_bg == 0)).astype(np.uint8)
+    n_int, lbl_int, stats_int, _ = cv2.connectedComponentsWithStats(strict_inner, connectivity=4)
+    for cid in range(1, n_int):
+        area = stats_int[cid, cv2.CC_STAT_AREA]
+        if area >= 45:
+            x, y, bw, bh = stats_int[cid, :4]
+            sub_m = (lbl_int[y:y + bh, x:x + bw] == cid)
+            mean_diff = float(np.mean(color_diff[y:y + bh, x:x + bw][sub_m]))
+            mean_grad = float(np.mean(grad_abs[y:y + bh, x:x + bw][sub_m]))
+            if mean_diff < 9.5 and mean_grad < 6.0:
+                true_bg[y:y + bh, x:x + bw][sub_m] = 255'''
+
+    # 5. 背景外沿 2px 过渡带去灰晕收口
+    rim_dilate = cv2.dilate(true_bg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    rim_zone = (rim_dilate > 0) & (true_bg == 0)
+    true_bg[rim_zone & (color_diff < 36)] = 255
+
+    alpha = np.where(true_bg > 0, 0, 255).astype(np.uint8)
+
+    # 6. 平滑去阶梯 + 用纯净的 AI 灰底图(bgr)做导向吸附，不被原图粉紫天空光带偏！
+    alpha = cv2.GaussianBlur(alpha, (5, 5), 0)
+    alpha = _guided_filter_edge(bgr, alpha, r=3, eps=0.002)
+
+    # 7. 边缘向内微收 1.5px (中点 160)，吃死原图和 AI 图那 1~2px 对齐错位杂边
+    alpha_f = (alpha.astype(np.float32) - 160.0) * 2.6 + 128.0
+    return np.clip(alpha_f, 0, 255).astype(np.uint8)
+
+
+def fuse_cutout_with_modnet(
+    src_bgr: np.ndarray,
+    base_alpha: np.ndarray,
+    manual_brush_mask: np.ndarray,
+    override_brush_mask: np.ndarray,
+    manual_erase_mask: np.ndarray,
+    feather_px: int = 15
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """立绘平滑抗锯齿合成：内部 100% 实心，外沿享受平滑微羽化，彻底告别台阶锯齿"""
+    t0 = time.time()
+    orig_h, orig_w = src_bgr.shape[:2]
+
+    cur_alpha = base_alpha.astype(np.float32)
+
+    # 1. 手动涂抹区做 3px 软边缘平滑，涂抹擦除自然不留硬疤
+    if manual_brush_mask is not None and cv2.countNonZero(manual_brush_mask) > 0:
+        b_soft = cv2.GaussianBlur(manual_brush_mask.astype(np.float32) / 255.0, (5, 5), 0)
+        cur_alpha = cur_alpha * (1.0 - b_soft)
+
+    if override_brush_mask is not None and cv2.countNonZero(override_brush_mask) > 0:
+        o_soft = cv2.GaussianBlur(override_brush_mask.astype(np.float32) / 255.0, (5, 5), 0)
+        cur_alpha = cur_alpha * (1.0 - o_soft)
+
+    # 2. 橡皮擦恢复同样带平滑过渡
+    if manual_erase_mask is not None and cv2.countNonZero(manual_erase_mask) > 0:
+        e_soft = cv2.GaussianBlur(manual_erase_mask.astype(np.float32), (5, 5), 0)
+        cur_alpha = np.maximum(cur_alpha, e_soft)
+
+    # 3. 联动左侧【边缘羽化】滑块，换算为 0.5px ~ 1.5px 的精细抗锯齿羽化（不外溢露底）
+    sigma = max(0.5, min(1.5, feather_px * 0.05))
+    cur_alpha = cv2.GaussianBlur(cur_alpha, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+    # 轻对比度锁定：保住内部 255 实心，外沿顺滑过渡
+    cur_alpha = np.clip((cur_alpha - 132.0) * 1.45 + 128.0, 0, 255).astype(np.uint8)
+
+    # 4. 合并为满血原图 BGRA
+    b, g, r = cv2.split(src_bgr)
+    bgra_fused = cv2.merge([b, g, r, cur_alpha])
+
+    mask_vis = 255 - cur_alpha
+    elapsed_ms = int((time.time() - t0) * 1000)
+    stats = {
+        "elapsed_ms": elapsed_ms,
+        "mask_area_pct": (cv2.countNonZero(mask_vis) / float(orig_h * orig_w)) * 100.0
+    }
+    return bgra_fused, mask_vis, stats
+
 
 class InpaintInitWorker(QThread):
     sig_status = Signal(str, int)
     sig_finished = Signal(dict)
     sig_error = Signal(str)
 
-    def __init__(self, orig_bgr: np.ndarray, patch_bgr: np.ndarray):
+    def __init__(self, orig_bgr: np.ndarray, patch_bgr: np.ndarray, session_mode: str = "inpaint"):
         super().__init__()
         self.orig_bgr = orig_bgr
         self.patch_bgr = patch_bgr
+        self.session_mode = session_mode
 
     def run(self):
         try:
@@ -271,39 +489,60 @@ class InpaintInitWorker(QThread):
             self.sig_status.emit("🤖 正在启动 MODNet 神经网络，构建模特发丝指尖结界...", 45)
             subject_matte = PortraitMatting.extract_subject_matte(self.orig_bgr, ref_size=512)
 
-            self.sig_status.emit("🔍 正在探测全图路人消除区与影子大包围网...", 75)
             orig_h, orig_w = self.orig_bgr.shape[:2]
-            k_b = 21
-            diff = cv2.absdiff(
-                cv2.GaussianBlur(self.orig_bgr, (k_b, k_b), 0),
-                cv2.GaussianBlur(patch_aligned, (k_b, k_b), 0)
-            )
-            diff_max = np.max(diff, axis=2)
-
-            gray = cv2.cvtColor(self.orig_bgr, cv2.COLOR_BGR2GRAY)
-            ceiling_h = int(orig_h * 0.25)
-            diff_max[:ceiling_h][gray[:ceiling_h] > 225] = 0
-
-            _, bin_diff = cv2.threshold(diff_max, 13, 255, cv2.THRESH_BINARY)
-            kernel_fuse = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
-            fused_blobs = cv2.morphologyEx(bin_diff, cv2.MORPH_CLOSE, kernel_fuse)
-
-            contours, _ = cv2.findContours(fused_blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             candidate_blobs = []
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area > 1000:
-                    mask_blob = np.zeros((orig_h, orig_w), dtype=np.uint8)
-                    cv2.drawContours(mask_blob, [cnt], -1, 255, thickness=-1)
-                    overlap = cv2.countNonZero(cv2.bitwise_and(mask_blob, (subject_matte > 0.5).astype(np.uint8) * 255))
-                    if overlap < area * 0.75:
-                        x, y, w, h = cv2.boundingRect(cnt)
-                        candidate_blobs.append({
-                            "id": len(candidate_blobs),
-                            "mask": mask_blob,
-                            "bbox": (x, y, w, h),
-                            "area": area
-                        })
+
+            if self.session_mode == "cutout":
+                self.sig_status.emit("🤖 正在让神经网络对 AI 纯净图进行平滑流线建模...", 60)
+                # 核心升级：直接在无路人干扰的 AI 图上提取发丝与人体流线，彻底杜绝锯齿撕裂！
+                cutout_matte = PortraitMatting.extract_subject_matte(patch_aligned, ref_size=512)
+                
+                self.sig_status.emit("✂️ 正在执行双核平滑剥离...", 85)
+                base_alpha = extract_ai_cutout_alpha(patch_aligned, cutout_matte, orig_bgr=self.orig_bgr)
+                
+                self.sig_status.emit("✨ 抠图完成，正在载入纯净画布...", 98)
+                self.sig_finished.emit({
+                    "patch_aligned": patch_aligned,
+                    "align_success": align_success,
+                    "subject_matte": cutout_matte,
+                    "candidate_blobs": [],
+                    "base_alpha": base_alpha,
+                    "session_mode": "cutout"
+                })
+                return
+            
+            else:
+                self.sig_status.emit("🔍 正在探测全图路人消除区与影子大包围网...", 75)
+                k_b = 21
+                diff = cv2.absdiff(
+                    cv2.GaussianBlur(self.orig_bgr, (k_b, k_b), 0),
+                    cv2.GaussianBlur(patch_aligned, (k_b, k_b), 0)
+                )
+                diff_max = np.max(diff, axis=2)
+
+                gray = cv2.cvtColor(self.orig_bgr, cv2.COLOR_BGR2GRAY)
+                ceiling_h = int(orig_h * 0.25)
+                diff_max[:ceiling_h][gray[:ceiling_h] > 225] = 0
+
+                _, bin_diff = cv2.threshold(diff_max, 13, 255, cv2.THRESH_BINARY)
+                kernel_fuse = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+                fused_blobs = cv2.morphologyEx(bin_diff, cv2.MORPH_CLOSE, kernel_fuse)
+
+                contours, _ = cv2.findContours(fused_blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area > 1000:
+                        mask_blob = np.zeros((orig_h, orig_w), dtype=np.uint8)
+                        cv2.drawContours(mask_blob, [cnt], -1, 255, thickness=-1)
+                        overlap = cv2.countNonZero(cv2.bitwise_and(mask_blob, (subject_matte > 0.5).astype(np.uint8) * 255))
+                        if overlap < area * 0.75:
+                            x, y, w, h = cv2.boundingRect(cnt)
+                            candidate_blobs.append({
+                                "id": len(candidate_blobs),
+                                "mask": mask_blob,
+                                "bbox": (x, y, w, h),
+                                "area": area
+                            })
 
             candidate_blobs.sort(key=lambda x: x["area"], reverse=True)
             for idx, b in enumerate(candidate_blobs):
@@ -315,11 +554,13 @@ class InpaintInitWorker(QThread):
                 "patch_aligned": patch_aligned,
                 "align_success": align_success,
                 "subject_matte": subject_matte,
-                "candidate_blobs": candidate_blobs
+                "candidate_blobs": candidate_blobs,
+                "session_mode": self.session_mode
             })
         except Exception as e:
             self.sig_error.emit(str(e))
 
+    
 
 class InpaintLoadingDialog(QDialog):
     def __init__(self, parent=None):
@@ -520,16 +761,26 @@ class InpaintWorkbenchWidget(QWidget):
         self.pixmap_subject = QPixmap()
         self.pixmap_fused = QPixmap()
         self.pixmap_mask = QPixmap()
+        self._custom_bg_pixmap = QPixmap()
+        
+
+        self.session_mode = "inpaint"      # "inpaint" (魔法消除) 或 "cutout" (一键抠图)
+        self.bg_preview_mode = "checker"   # "checker", "white", "black", "green", "gray"
+        self.bgra_fused = None
+        self._checker_pixmap = self._generate_checker_pattern(16)
 
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self._on_anim_tick)
         self.anim_timer.start(16)
-
+        
         self._init_ui()
 
     def load_session_data(self, orig_bgr: np.ndarray, patch_aligned: np.ndarray,
                           subject_matte: np.ndarray, candidate_blobs: list,
-                          orig_file_path: str, dilate_px: int, feather_px: int):
+                          orig_file_path: str, dilate_px: int, feather_px: int,
+                          session_mode: str = "inpaint"):
+        self.session_mode = session_mode
+        self.base_alpha = None
         self.orig_bgr = orig_bgr
         self.patch_aligned = patch_aligned
         self.subject_matte = subject_matte
@@ -538,8 +789,16 @@ class InpaintWorkbenchWidget(QWidget):
         self.dilate_px = dilate_px
         self.feather_px = feather_px
 
-        orig_h, orig_w = orig_bgr.shape[:2]
+        is_cutout = (self.session_mode == "cutout")
+        self.combo_bg_preview.setVisible(is_cutout)
+        self.lbl_bg_preview.setVisible(is_cutout)
+        self.btn_fused.setText("✂️ 扣出成片 [1]" if is_cutout else "✨ 快速消除 [1]")
+        self.btn_orig.setText("📷 原始原片 [2]" if is_cutout else "📷 消除前 [2]")
+        self.btn_mask.setText("🖤 边缘检查 [3]" if is_cutout else "🖤 精修模式 [3]")
+        self.btn_patch.setVisible(True)
+        self.btn_subject.setVisible(not is_cutout)
 
+        orig_h, orig_w = orig_bgr.shape[:2]
         self.selected_blob_ids = {b["id"] for b in self.candidate_blobs}
         self.hovered_blob_id = -1
 
@@ -559,6 +818,9 @@ class InpaintWorkbenchWidget(QWidget):
         self.pixmap_patch = QPixmap.fromImage(bgr_to_qimage(self.patch_aligned))
         subject_vis = (self.subject_matte * 255.0).astype(np.uint8)
         self.pixmap_subject = QPixmap.fromImage(QImage(subject_vis.data, orig_w, orig_h, orig_w, QImage.Format_Grayscale8).copy())
+
+        if hasattr(self, "_incoming_base_alpha") and self._incoming_base_alpha is not None:
+            self.base_alpha = self._incoming_base_alpha
 
         self._recompute_fusion()
         self._update_undo_redo_ui()
@@ -707,7 +969,41 @@ class InpaintWorkbenchWidget(QWidget):
         return gen_mask
 
     def _recompute_fusion(self):
-        if self.orig_bgr is None or self.patch_aligned is None:
+        if self.orig_bgr is None:
+            return
+
+        # ---------------- 抠图模式专线 ----------------
+        if self.session_mode == "cutout":
+            if self.base_alpha is None:
+                self.base_alpha = (self.subject_matte * 255.0).astype(np.uint8)
+
+            # 核心：从 AI 图提取干净蒙版，把蒙版转嫁回 100% 无损满血原图 orig_bgr！
+            target_source = self.orig_bgr
+
+            self.bgra_fused, self.mask, self.stats = fuse_cutout_with_modnet(
+                target_source,
+                base_alpha=self.base_alpha,
+                manual_brush_mask=self.manual_brush_mask,
+                override_brush_mask=self.override_brush_mask,
+                manual_erase_mask=self.manual_erase_mask,
+                feather_px=self.feather_px
+            )
+
+            # 转为带 Alpha 的 QImage
+            rgba = cv2.cvtColor(self.bgra_fused, cv2.COLOR_BGRA2RGBA)
+            h, w = rgba.shape[:2]
+            qimg_fused = QImage(rgba.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
+            self.pixmap_fused = QPixmap.fromImage(qimg_fused)
+
+            # 边缘检查视图：暗底透视
+            vis = target_source.copy()
+            if self.mask is not None and cv2.countNonZero(self.mask) > 0:
+                vis[self.mask > 0] = (vis[self.mask > 0] * 0.25).astype(np.uint8)
+            self.pixmap_mask = QPixmap.fromImage(bgr_to_qimage(vis))
+            return
+
+        # ---------------- 魔法消除模式专线 ----------------
+        if self.patch_aligned is None:
             return
         gen_mask = self._get_generous_mask()
         self.fused_bgr, self.mask, self.stats = fuse_generous_with_modnet(
@@ -727,6 +1023,18 @@ class InpaintWorkbenchWidget(QWidget):
             vis[self.mask > 0] = (vis[self.mask > 0] * 0.45).astype(np.uint8)
         self.pixmap_mask = QPixmap.fromImage(bgr_to_qimage(vis))
 
+    @staticmethod
+    def _generate_checker_pattern(tile_size: int = 16) -> QPixmap:
+        pm = QPixmap(tile_size * 2, tile_size * 2)
+        p = QPainter(pm)
+        c1, c2 = QColor("#222226"), QColor("#18181c")
+        p.fillRect(0, 0, tile_size, tile_size, c1)
+        p.fillRect(tile_size, 0, tile_size, tile_size, c2)
+        p.fillRect(0, tile_size, tile_size, tile_size, c2)
+        p.fillRect(tile_size, tile_size, tile_size, tile_size, c1)
+        p.end()
+        return pm
+
     def _init_ui(self):
         root_vlayout = QVBoxLayout(self)
         root_vlayout.setContentsMargins(0, 0, 0, 0)
@@ -738,7 +1046,7 @@ class InpaintWorkbenchWidget(QWidget):
         top_bar.setStyleSheet("background-color: #121216; border-bottom: 1px solid #27272f; padding: 0 12px;")
         tb_layout = QHBoxLayout(top_bar)
         tb_layout.setContentsMargins(6, 0, 6, 0)
-        tb_layout.setSpacing(8)
+        tb_layout.setSpacing(6)
 
         self.btn_back = QPushButton("‹ 返回输入")
         self.btn_back.setToolTip("返回底图与网页输入界面")
@@ -760,11 +1068,12 @@ class InpaintWorkbenchWidget(QWidget):
         self.btn_back.clicked.connect(self.sig_back_requested.emit)
         tb_layout.addWidget(self.btn_back)
 
-        tb_layout.addSpacing(6)
+        tb_layout.addSpacing(4)
 
-        self.btn_fused = QPushButton("✨ 快速消除 [1]")
-        self.btn_orig = QPushButton("📷 消除前 [2]")
-        self.btn_mask = QPushButton("🖤 精修模式 [3]")
+        # 视图切换按钮组
+        self.btn_fused = QPushButton("✨ 扣出成片 [1]")
+        self.btn_orig = QPushButton("📷 原始原片 [2]")
+        self.btn_mask = QPushButton("🖤 边缘检查 [3]")
         self.btn_patch = QPushButton("🎯 期望效果图 [4]")
         self.btn_subject = QPushButton("🛡️ 模特保护透视 [5]")
 
@@ -777,6 +1086,49 @@ class InpaintWorkbenchWidget(QWidget):
         self.btn_mask.clicked.connect(lambda: self._set_mode("mask"))
         self.btn_patch.clicked.connect(lambda: self._set_mode("patch"))
         self.btn_subject.clicked.connect(lambda: self._set_mode("subject"))
+
+        tb_layout.addSpacing(6)
+
+        # 核心：背景切换控制坞 (直接挂在按钮旁边，极其显眼，绝不折叠！)
+        self.lbl_bg_preview = QLabel("🎨 背景:")
+        self.lbl_bg_preview.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        tb_layout.addWidget(self.lbl_bg_preview)
+
+        self.combo_bg_preview = QComboBox()
+        self.combo_bg_preview.addItem("🏁 PS灰白方格 (透明底)", "checker")
+        self.combo_bg_preview.addItem("⬜ 纯白底色 (验黑边)", "white")
+        self.combo_bg_preview.addItem("⬛ 纯黑底色 (验白边)", "black")
+        self.combo_bg_preview.addItem("🟩 绿幕影视底", "green")
+        self.combo_bg_preview.addItem("🩶 18%中性灰", "gray")
+        self.combo_bg_preview.addItem("🌄 导入自定义背景图...", "custom_img")
+        self.combo_bg_preview.setFocusPolicy(Qt.NoFocus)
+        self.combo_bg_preview.setStyleSheet("""
+            QComboBox {
+                background-color: #18181e;
+                border: 1px solid #0284c7;
+                border-radius: 4px;
+                padding: 3px 8px;
+                color: #38bdf8;
+                font-weight: bold;
+                font-size: 11px;
+                min-width: 140px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #18181e;
+                border: 1px solid #3f3f46;
+                selection-background-color: #0284c7;
+                color: #f4f4f5;
+            }
+        """)
+        self.combo_bg_preview.currentIndexChanged.connect(self._on_bg_preview_changed)
+        tb_layout.addWidget(self.combo_bg_preview)
+
+        
+
+        
+        
+
+        
 
         tb_layout.addStretch()
 
@@ -911,7 +1263,7 @@ class InpaintWorkbenchWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        dw = min(980, max(880, self.viewport.width() - 40))
+        dw = min(1100, max(980, self.viewport.width() - 40))
         dh = 52
         dx = (self.viewport.width() - dw) // 2
         dy = self.viewport.height() - dh - 24
@@ -945,6 +1297,10 @@ class InpaintWorkbenchWidget(QWidget):
         act_brush = "background-color: #0284c7; color: white; border: 1px solid #38bdf8; border-radius: 16px; padding: 6px 16px;"
         act_eraser = "background-color: #d97706; color: white; border: 1px solid #fbbf24; border-radius: 16px; padding: 6px 16px;"
         self.btn_tool_brush.setStyleSheet(act_brush if self.current_tool == "brush" else "padding: 6px 16px;")
+        self.btn_tool_eraser.setStyleSheet(act_eraser if self.current_tool == "eraser" else "padding: 6px 16px;")
+        self.btn_tool_brush.setStyleSheet(act_brush if self.current_tool == "brush" else "padding: 6px 16px;")
+        self.btn_tool_eraser.setStyleSheet(act_eraser if self.current_tool == "eraser" else "padding: 6px 16px;")
+        
         self.btn_tool_eraser.setStyleSheet(act_eraser if self.current_tool == "eraser" else "padding: 6px 16px;")
 
         if self.shield_override:
@@ -1033,8 +1389,27 @@ class InpaintWorkbenchWidget(QWidget):
         dw, dh = iw * scale, ih * scale
         dx = (w - dw) / 2.0 + self.pan.x()
         dy = (h - dh) / 2.0 + self.pan.y()
+        target_draw_rect = QRectF(dx, dy, dw, dh).toRect()
 
-        painter.drawPixmap(QRectF(dx, dy, dw, dh).toRect(), target)
+        # 抠图模式下在主体下方垫一层棋盘格、纯色或自定义背景图
+        if self.session_mode == "cutout" and self.view_mode == "fused":
+            painter.save()
+            painter.setClipRect(target_draw_rect)
+            if self.bg_preview_mode == "white":
+                painter.fillRect(target_draw_rect, QColor("#FFFFFF"))
+            elif self.bg_preview_mode == "black":
+                painter.fillRect(target_draw_rect, QColor("#000000"))
+            elif self.bg_preview_mode == "green":
+                painter.fillRect(target_draw_rect, QColor("#00FF00"))
+            elif self.bg_preview_mode == "gray":
+                painter.fillRect(target_draw_rect, QColor("#808080"))
+            elif self.bg_preview_mode == "custom_img" and hasattr(self, "_custom_bg_pixmap") and not self._custom_bg_pixmap.isNull():
+                painter.drawPixmap(target_draw_rect, self._custom_bg_pixmap)
+            else:  # "checker"
+                painter.drawTiledPixmap(target_draw_rect, self._checker_pixmap)
+            painter.restore()
+
+        painter.drawPixmap(target_draw_rect, target)
 
         if self.is_brushing and not self.current_stroke_path.isEmpty():
             brush_screen_d = (self.brush_size * scale) * 2.0
@@ -1161,6 +1536,7 @@ class InpaintWorkbenchWidget(QWidget):
 
         ix = int((event.position().x() - dx) / scale)
         iy = int((event.position().y() - dy) / scale)
+        
 
         if event.button() == Qt.RightButton:
             if self.view_mode == "fused":
@@ -1450,16 +1826,110 @@ class InpaintWorkbenchWidget(QWidget):
 
     def _save_as(self):
         default_dir = Path(self.orig_file_path).parent if self.orig_file_path else Path.home()
-        default_stem = Path(self.orig_file_path).stem if self.orig_file_path else "inpainted_photo"
-        default_name = str(default_dir / f"{default_stem}_inpainted.jpg")
+        default_stem = Path(self.orig_file_path).stem if self.orig_file_path else "photo"
 
-        out, _ = QFileDialog.getSaveFileName(
-            self, "另存为满血成片",
-            default_name,
-            "JPEG 图像 (*.jpg);;PNG 图像 (*.png)"
-        )
-        if out and imwrite_unicode(out, self.fused_bgr, quality=96, orig_file_path=self.orig_file_path):
-            QMessageBox.information(self, "保存成功", f"满血成片已保存至：\n{out}\n\n已成功保留并注入原始 EXIF 拍摄参数、镜头型号与色彩配置！")
+        if self.session_mode == "cutout":
+            default_name = str(default_dir / f"{default_stem}_cutout.png")
+            out, _ = QFileDialog.getSaveFileName(
+                self, "另存为透明底满血 PNG",
+                default_name,
+                "PNG 图像 (*.png);;JPEG 图像 (*.jpg)"
+            )
+            if out:
+                # 若保存 PNG，直接写入 4 通道 BGRA；若保存 JPG，写入白底
+                img_to_save = self.bgra_fused if self.bgra_fused is not None else (self.patch_aligned if self.patch_aligned is not None else self.orig_bgr)
+                if imwrite_unicode(out, img_to_save, quality=96, orig_file_path=self.orig_file_path):
+                    QMessageBox.information(self, "保存成功", f"透明底满血成片已保存至：\n{out}\n\n已完整保留 100% 原图物理分辨率与发丝透光细节！")
+        else:
+            default_name = str(default_dir / f"{default_stem}_inpainted.jpg")
+            out, _ = QFileDialog.getSaveFileName(
+                self, "另存为满血成片",
+                default_name,
+                "JPEG 图像 (*.jpg);;PNG 图像 (*.png)"
+            )
+            if out and imwrite_unicode(out, self.fused_bgr, quality=96, orig_file_path=self.orig_file_path):
+                QMessageBox.information(self, "保存成功", f"满血成片已保存至：\n{out}\n\n已成功保留并注入原始 EXIF 拍摄参数、镜头型号与色彩配置！")
+
+    def _on_bg_preview_changed(self):
+        val = self.combo_bg_preview.currentData()
+        if val == "custom_img":
+            f, _ = QFileDialog.getOpenFileName(
+                self, "选择自定义背景图片", "",
+                "图片 (*.jpg *.jpeg *.png *.webp *.bmp);;所有文件 (*.*)"
+            )
+            if f and os.path.exists(f):
+                bg_mat = imread_unicode(f)
+                if bg_mat is not None:
+                    # 自动缩放到原图同比例
+                    h, w = self.orig_bgr.shape[:2]
+                    resized_bg = cv2.resize(bg_mat, (w, h), interpolation=cv2.INTER_LANCZOS4)
+                    self._custom_bg_pixmap = QPixmap.fromImage(bgr_to_qimage(resized_bg))
+                    self.bg_preview_mode = "custom_img"
+                else:
+                    self.combo_bg_preview.setCurrentIndex(0)
+            else:
+                self.combo_bg_preview.setCurrentIndex(0)
+        else:
+            self.bg_preview_mode = val
+
+        self.viewport.update()
+
+    def _pick_target_erase_color(self):
+        c = QColorDialog.getColor(QColor(self.target_erase_color_hex), self, "选择要精确消除的背景色")
+        if c.isValid():
+            self.target_erase_color_hex = c.name().upper()
+            self.btn_target_color.setText(self.target_erase_color_hex)
+            lum = c.lightness()
+            txt_col = "#000000" if lum > 140 else "#ffffff"
+            self.btn_target_color.setStyleSheet(
+                f"QPushButton {{ background-color: {self.target_erase_color_hex}; color: {txt_col}; "
+                f"border: 1px solid #c084fc; border-radius: 4px; padding: 2px 8px; "
+                f"font-family: Consolas; font-size: 11px; font-weight: bold; }}"
+            )
+
+    def _filter_mask_by_target_color(self, roi_mask: np.ndarray) -> np.ndarray:
+        """在圈选/涂抹区域内，直接对【原图 orig_bgr】做平滑色差消除，绝不误伤错位发丝、绝不狗啃"""
+        src = self.orig_bgr
+        if src is None:
+            return roi_mask
+
+        tc = QColor(self.target_erase_color_hex)
+        target_bgr = np.array([tc.blue(), tc.green(), tc.red()], dtype=np.float32)
+        tol = float(self.spin_color_tol.value())
+
+        ys, xs = np.where(roi_mask > 0)
+        if len(ys) == 0:
+            return roi_mask
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+
+        sub_img = src[y1:y2, x1:x2, :3].astype(np.float32)
+        sub_roi = roi_mask[y1:y2, x1:x2] > 0
+
+        if tol <= 0.0:
+            # 容差 0：100% 精确相等才杀
+            match = (
+                (sub_img[:, :, 0] == target_bgr[0]) &
+                (sub_img[:, :, 1] == target_bgr[1]) &
+                (sub_img[:, :, 2] == target_bgr[2])
+            )
+            soft_alpha = np.where(match, 255, 0).astype(np.uint8)
+        else:
+            # 平滑色差斜坡：核心色差内 100% 杀掉，边缘过渡带平滑衰减，消灭 1px 椒盐狗啃
+            dist = np.linalg.norm(sub_img - target_bgr, axis=2)
+            low = tol * 0.65
+            high = max(low + 1.0, tol * 1.25)
+            soft = np.clip((high - dist) / (high - low), 0.0, 1.0) * 255.0
+            soft_u8 = soft.astype(np.uint8)
+
+            # 3x3 开闭平滑：清除头发丝内部孤立的 1px 椒盐噪点
+            k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            core_bin = cv2.morphologyEx((soft_u8 > 128).astype(np.uint8) * 255, cv2.MORPH_OPEN, k3)
+            soft_alpha = cv2.GaussianBlur(np.minimum(soft_u8, cv2.dilate(core_bin, k3)), (3, 3), 0)
+
+        out_mask = np.zeros_like(roi_mask)
+        out_mask[y1:y2, x1:x2][sub_roi] = soft_alpha[sub_roi]
+        return out_mask
 
 
 # ==============================================================================
@@ -1478,6 +1948,8 @@ class InpaintPageWidget(QWidget):
         self.patch_bgr = None
         self.init_worker = None
         self.loading_dialog = None
+        self.photomerge_widget = None
+        self.cosplaymerge_widget = None
 
         self.cache_root = get_app_cache_root()
         self.download_dir = self.cache_root / "inpaint_downloads"
@@ -1549,7 +2021,6 @@ class InpaintPageWidget(QWidget):
 
         self.lbl_patch_file = QLabel("当前补丁: 尚未捕获")
         self.lbl_patch_file.setStyleSheet("color: #a1a1aa; font-family: Consolas; font-size: 11px;")
-        sb_l.addWidget(self.lbl_patch_file)
         left_layout.addWidget(self.status_box)
 
         left_layout.addWidget(QLabel("🎛️ 3. 缝合参数策略"))
@@ -1583,18 +2054,93 @@ class InpaintPageWidget(QWidget):
 
         left_layout.addWidget(cfg_box)
 
-        self.btn_fuse = QPushButton("🪄 启动 AI 魔法消除与缝合")
+        # 快捷提示词工具组
+        left_layout.addWidget(QLabel("💬 4. 常用 AI 指令 (点击秒拷到剪贴板):"))
+        prompt_box = QFrame()
+        prompt_box.setStyleSheet("background-color: #18181e; border: 1px solid #27272f; border-radius: 6px; padding: 6px;")
+        pb_l = QVBoxLayout(prompt_box)
+        pb_l.setSpacing(5)
+
+        h_prompts = QHBoxLayout()
+        h_prompts.setSpacing(6)
+
+        prompts = [
+            ("🚶 消除路人", "请消除画面中除前景主体人物外的所有背景路人，完美修补被遮挡的背景环境"),
+            ("🧰 消除路人杂物", "请消除画面中的所有背景路人以及地面的垃圾杂物、摄影器材、警示标牌，保持主体不变"),
+            ("🖤 黑白剪影抠图", "请将这张图片严格转换成纯黑白剪影蒙版：把前景主体人物（包含所有发丝、服装、配饰和手持道具的完整轮廓）全部填充为纯黑色（#000000），把人物以外的所有背景和发丝之间的缝隙全部填充为纯白色（#FFFFFF），保持原图人物姿势、构图和边缘位置100%不变"),
+        ]
+
+        for title, p_text in prompts:
+            btn_p = QPushButton(title)
+            btn_p.setToolTip(f"点击复制指令：\n{p_text}")
+            btn_p.setStyleSheet("""
+                QPushButton {
+                    background-color: #202028; border: 1px solid #3f3f46; border-radius: 4px;
+                    padding: 5px 4px; font-size: 11px; font-weight: bold; color: #38bdf8;
+                }
+                QPushButton:hover { background-color: #0284c7; color: #ffffff; }
+            """)
+            btn_p.clicked.connect(lambda ch=False, txt=p_text: self._copy_prompt_to_clipboard(txt))
+            h_prompts.addWidget(btn_p)
+        pb_l.addLayout(h_prompts)
+        left_layout.addWidget(prompt_box)
+
+        # 启动按钮行：双核驱动（魔法消除 / 一键抠图）
+        h_fuse_btns = QHBoxLayout()
+        h_fuse_btns.setSpacing(8)
+
+        self.btn_fuse = QPushButton("🪄 启动魔法消除")
         self.btn_fuse.setEnabled(False)
         self.btn_fuse.setStyleSheet("""
             QPushButton {
                 background-color: #0284c7; color: white; font-weight: bold; padding: 10px;
-                font-size: 13px; border-radius: 6px; border: none;
+                font-size: 12px; border-radius: 6px; border: none;
             }
             QPushButton:hover { background-color: #0369a1; }
             QPushButton:disabled { background-color: #27272a; color: #52525b; }
         """)
-        self.btn_fuse.clicked.connect(self._do_fusion)
-        left_layout.addWidget(self.btn_fuse)
+        self.btn_fuse.clicked.connect(lambda: self._do_fusion("inpaint"))
+        h_fuse_btns.addWidget(self.btn_fuse)
+
+        self.btn_cutout = QPushButton("✂️ 一键透明抠图")
+        self.btn_cutout.setEnabled(False)
+        self.btn_cutout.setToolTip("利用 AI 图推导主体轮廓，原图 100% 满血发丝抠出，输出透明底 PNG")
+        self.btn_cutout.setStyleSheet("""
+            QPushButton {
+                background-color: #16a34a; color: white; font-weight: bold; padding: 10px;
+                font-size: 12px; border-radius: 6px; border: none;
+            }
+            QPushButton:hover { background-color: #15803d; }
+            QPushButton:disabled { background-color: #27272a; color: #52525b; }
+        """)
+        self.btn_cutout.clicked.connect(lambda: self._do_fusion("cutout"))
+        h_fuse_btns.addWidget(self.btn_cutout)
+
+        left_layout.addLayout(h_fuse_btns)
+
+        self.btn_photomerge = QPushButton("🌌 启动二次元光学溶图工作台")
+        self.btn_photomerge.setToolTip("进入独立光学溶图工作台（需手动导入底图与透明底 PNG）")
+        self.btn_photomerge.setStyleSheet("""
+            QPushButton {
+                background-color: #6d28d9; color: white; font-weight: bold; padding: 10px;
+                font-size: 13px; border-radius: 6px; border: none;
+            }
+            QPushButton:hover { background-color: #5b21b6; }
+        """)
+        self.btn_photomerge.clicked.connect(self._open_photomerge)
+        left_layout.addWidget(self.btn_photomerge)
+
+        self.btn_cosplay_merge = QPushButton("📸 启动场照溶图工作台")
+        self.btn_cosplay_merge.setToolTip("进入真人场照光学溶图与虚拟大光圈重打光工作台")
+        self.btn_cosplay_merge.setStyleSheet("""
+            QPushButton {
+                background-color: #0369a1; color: white; font-weight: bold; padding: 10px;
+                font-size: 13px; border-radius: 6px; border: none;
+            }
+            QPushButton:hover { background-color: #0284c7; }
+        """)
+        self.btn_cosplay_merge.clicked.connect(self._open_cosplay_merge)
+        left_layout.addWidget(self.btn_cosplay_merge)
 
         left_layout.addStretch()
         splitter.addWidget(left_panel)
@@ -1651,6 +2197,7 @@ class InpaintPageWidget(QWidget):
         self.page_stack.addWidget(self.workbench_widget)
 
         root_layout.addWidget(self.page_stack)
+        self.page_stack.setCurrentIndex(0)
 
     def _setup_webengine(self, parent_layout: QVBoxLayout, initial_url: str):
         self.custom_profile = QWebEngineProfile("AnicropInpaintSandbox", self)
@@ -1703,6 +2250,7 @@ class InpaintPageWidget(QWidget):
                 self.lbl_patch_file.setText(f"📁 {target_filename} ({self.patch_bgr.shape[1]}×{self.patch_bgr.shape[0]})")
                 if self.orig_bgr is not None:
                     self.btn_fuse.setEnabled(True)
+                    self.btn_cutout.setEnabled(True)
 
         download.stateChanged.connect(_on_state_changed)
 
@@ -1759,49 +2307,39 @@ class InpaintPageWidget(QWidget):
         self.btn_copy_orig.setEnabled(True)
         if self.patch_bgr is not None:
             self.btn_fuse.setEnabled(True)
+            self.btn_cutout.setEnabled(True)
 
         self.sig_photo_loaded.emit(file_path)
 
-    def _do_fusion(self):
-        if self.orig_bgr is None or self.patch_bgr is None:
-            return
+    def _open_photomerge(self):
+        if self.photomerge_widget is None:
+            try:
+                from photomerge.merge_ui import PhotoMergePageWidget
+                self.photomerge_widget = PhotoMergePageWidget(self)
+                self.photomerge_widget.sig_back_requested.connect(self._switch_to_prep)
+                self.page_stack.addWidget(self.photomerge_widget)
+            except Exception as e:
+                QMessageBox.critical(self, "溶图工作台加载失败", f"无法初始化光学溶图引擎:\n{e}")
+                return
 
-        win = self.window()
-        if hasattr(win, "indicator") and win.indicator:
-            win.indicator.set_busy(True)
+        self.page_stack.setCurrentWidget(self.photomerge_widget)
+        self.photomerge_widget.setFocus()
 
-        self.btn_fuse.setEnabled(False)
-        self.loading_dialog = InpaintLoadingDialog(self)
+    def _open_cosplay_merge(self):
+        if self.cosplaymerge_widget is None:
+            try:
+                from photomerge.merge_ui import PhotoMergePageWidget
+                self.cosplaymerge_widget = PhotoMergePageWidget(self, mode="cosplay")
+                self.cosplaymerge_widget.sig_back_requested.connect(self._switch_to_prep)
+                self.page_stack.addWidget(self.cosplaymerge_widget)
+            except Exception as e:
+                QMessageBox.critical(self, "场照溶图工作台加载失败", f"无法初始化场照光学溶图引擎:\n{e}")
+                return
 
-        self.init_worker = InpaintInitWorker(self.orig_bgr, self.patch_bgr)
-        self.init_worker.sig_status.connect(self.loading_dialog.set_status)
-        self.init_worker.sig_finished.connect(self._on_init_worker_finished)
-        self.init_worker.sig_error.connect(self._on_init_worker_error)
-        self.init_worker.start()
-
-        self.loading_dialog.exec()
-
-    def _on_init_worker_finished(self, data: dict):
-        self.btn_fuse.setEnabled(True)
-        win = self.window()
-        if hasattr(win, "indicator") and win.indicator:
-            win.indicator.set_busy(False)
-
-        self.workbench_widget.load_session_data(
-            orig_bgr=self.orig_bgr,
-            patch_aligned=data["patch_aligned"],
-            subject_matte=data["subject_matte"],
-            candidate_blobs=data["candidate_blobs"],
-            orig_file_path=self.original_image_path,
-            dilate_px=self.slider_dilate.value(),
-            feather_px=self.slider_feather.value()
-        )
-        self.page_stack.setCurrentIndex(1)
-        self.workbench_widget.setFocus()
-
-        if self.loading_dialog:
-            self.loading_dialog.accept()
-            self.loading_dialog = None
+        self.page_stack.setCurrentWidget(self.cosplaymerge_widget)
+        self.cosplaymerge_widget.setFocus()
+        if self.original_image_path and os.path.exists(self.original_image_path) and self.cosplaymerge_widget.pipeline.bg_full_u8 is None:
+            self.cosplaymerge_widget.load_cosplay_photo(self.original_image_path)
 
     def _switch_to_prep(self):
         self.page_stack.setCurrentIndex(0)
@@ -1811,7 +2349,59 @@ class InpaintPageWidget(QWidget):
             self.loading_dialog.reject()
             self.loading_dialog = None
         self.btn_fuse.setEnabled(True)
+        self.btn_cutout.setEnabled(True)
         win = self.window()
         if hasattr(win, "indicator") and win.indicator:
             win.indicator.set_busy(False)
         QMessageBox.critical(self, "计算异常", f"缝合前处理失败:\n{err_msg}")
+
+    def _copy_prompt_to_clipboard(self, prompt_text: str):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(prompt_text)
+        self.lbl_intercept_status.setText(f"📋 指令已复制：可在右侧网页直接 Ctrl+V 发送！")
+        self.lbl_intercept_status.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold;")
+
+    def _do_fusion(self, session_mode: str = "inpaint"):
+        if self.orig_bgr is None or self.patch_bgr is None:
+            return
+
+        win = self.window()
+        if hasattr(win, "indicator") and win.indicator:
+            win.indicator.set_busy(True)
+
+        self.btn_fuse.setEnabled(False)
+        self.btn_cutout.setEnabled(False)
+        self.loading_dialog = InpaintLoadingDialog(self)
+
+        self.init_worker = InpaintInitWorker(self.orig_bgr, self.patch_bgr, session_mode=session_mode)
+        self.init_worker.sig_status.connect(self.loading_dialog.set_status)
+        self.init_worker.sig_finished.connect(self._on_init_worker_finished)
+        self.init_worker.sig_error.connect(self._on_init_worker_error)
+        self.init_worker.start()
+
+        self.loading_dialog.exec()
+
+    def _on_init_worker_finished(self, data: dict):
+        self.btn_fuse.setEnabled(True)
+        self.btn_cutout.setEnabled(True)
+        win = self.window()
+        if hasattr(win, "indicator") and win.indicator:
+            win.indicator.set_busy(False)
+
+        self.workbench_widget._incoming_base_alpha = data.get("base_alpha")
+        self.workbench_widget.load_session_data(
+            orig_bgr=self.orig_bgr,
+            patch_aligned=data["patch_aligned"],
+            subject_matte=data["subject_matte"],
+            candidate_blobs=data["candidate_blobs"],
+            orig_file_path=self.original_image_path,
+            dilate_px=self.slider_dilate.value(),
+            feather_px=self.slider_feather.value(),
+            session_mode=data.get("session_mode", "inpaint")
+        )
+        self.page_stack.setCurrentIndex(1)
+        self.workbench_widget.setFocus()
+
+        if self.loading_dialog:
+            self.loading_dialog.accept()
+            self.loading_dialog = None

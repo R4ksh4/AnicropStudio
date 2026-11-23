@@ -30,7 +30,7 @@ QMainWindow {
 
 QWidget {
     color: #e4e4e7;
-    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-family: "Microsoft YaHei UI", "Segoe UI", "Microsoft YaHei", sans-serif;
     font-size: 13px;
 }
 
@@ -51,7 +51,7 @@ QPushButton.NavTab {
     background-color: transparent;
     border: none;
     border-bottom: 2px solid transparent;
-    padding: 5px 12px;
+    padding: 4px 12px 6px 12px;
     font-weight: 600;
     font-size: 12px;
     color: #a1a1aa;
@@ -961,7 +961,7 @@ class SettingsPageWidget(QWidget):
         try:
             from main import APP_VERSION
         except Exception:
-            APP_VERSION = "Beta 4.2.0"
+            APP_VERSION = "Beta 5.0.0"
         lbl_app_info = QLabel(f"Anicrop Studio ({APP_VERSION})")
         lbl_app_info.setStyleSheet("font-size: 15px; font-weight: bold; color: #38bdf8;")
         about_layout.addWidget(lbl_app_info)
@@ -1195,7 +1195,7 @@ class MainWindow(QMainWindow):
         try:
             from main import APP_VERSION
         except Exception:
-            APP_VERSION = "Beta 4.2.0"
+            APP_VERSION = "Beta 5.0.0"
         self.setWindowTitle(f"Anicrop Studio - 二次元漫展返图流极客工作台 [{APP_VERSION}]")
         self.resize(1320, 880)
         self.setMinimumSize(1024, 720)
@@ -1220,7 +1220,7 @@ class MainWindow(QMainWindow):
         # 1. 顶部全局导航
         self.top_nav = QWidget()
         self.top_nav.setObjectName("TopNavWidget")
-        self.top_nav.setFixedHeight(32)
+        self.top_nav.setFixedHeight(36)
         top_nav_layout = QHBoxLayout(self.top_nav)
         top_nav_layout.setContentsMargins(10, 0, 10, 0)
         top_nav_layout.setSpacing(2)
@@ -1240,7 +1240,7 @@ class MainWindow(QMainWindow):
         self.btn_tab_darkroom.clicked.connect(lambda: self._switch_tab(1))
         top_nav_layout.addWidget(self.btn_tab_darkroom)
 
-        self.btn_tab_inpaint = QPushButton("🪄 AI 魔法消除")
+        self.btn_tab_inpaint = QPushButton("🪄 AI 魔法消除&&溶图工作台")
         self.btn_tab_inpaint.setProperty("class", "NavTab")
         self.btn_tab_inpaint.setToolTip("AI 网页背景修补 + 原图无损缝合的魔法消除工作台")
         self.btn_tab_inpaint.clicked.connect(lambda: self._switch_tab(2))
@@ -1467,7 +1467,7 @@ class MainWindow(QMainWindow):
         title_map = {
             0: "🖼️ 漫展画廊初筛",
             1: "🧪 极客暗房工坊",
-            2: "🪄 魔法消除工作台",
+            2: "🪄 AI 魔法消除&&溶图工作台",
             3: "🏷️ 参数画框工作台",
             4: "📡 移动端隔空快传",
             5: "⚙️ 系统全局偏好"

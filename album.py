@@ -4270,6 +4270,7 @@ class SinglePhotoViewer(QWidget):
         k_cmp = shortcut_qt_key(sc["compare"])
         k_grid = shortcut_qt_key(sc.get("grid", "Q"))
         k_crop = shortcut_qt_key(sc.get("precrop", "W"))
+        k_lock_vp = shortcut_qt_key(sc.get("lock_viewport", "V"))
         k_trash = shortcut_qt_key(sc.get("trash", "G"))
 
         k_cmp_l_prev = shortcut_qt_key(sc.get("cmp_l_prev", "U"))
@@ -4309,7 +4310,6 @@ class SinglePhotoViewer(QWidget):
             else:
                 self._on_back_clicked()
             event.accept()
-        # 键盘【↑ ↓ ← →】真·上下左右平移漫游！
         elif key == Qt.Key_Up:
             self._route_pan_delta(QPointF(0, 60))
             event.accept()
@@ -4328,7 +4328,6 @@ class SinglePhotoViewer(QWidget):
         elif key == k_next:
             self.next_image()
             event.accept()
-        # 暗房模式下按下 G (可改绑) 或 Backspace，一键丢入废片篓
         elif key in (k_trash, Qt.Key_Backspace) and self.is_darkroom:
             self._on_throw_trash_clicked()
             event.accept()
@@ -4336,7 +4335,6 @@ class SinglePhotoViewer(QWidget):
         elif key in (k_mark, Qt.Key_X, Qt.Key_Delete):
             self._on_mark_toggle_clicked()
             event.accept()
-        # S 键切换已被物理锁死，RAW 解析统一由「系统设置」接管
         elif event.text() in ("0", "1", "2", "3", "4", "5"):
             path = self.get_active_path()
             if path:
@@ -4347,7 +4345,6 @@ class SinglePhotoViewer(QWidget):
             event.accept()
         elif key == k_grid:
             if event.modifiers() & Qt.ShiftModifier:
-                # Shift + Q: 翻转黄金螺旋朝向象限 (对标 Lightroom Shift+O)
                 self.spiral_orientation = (self.spiral_orientation + 1) % 4
                 self.update()
             else:
@@ -4359,25 +4356,18 @@ class SinglePhotoViewer(QWidget):
         elif key == k_lock_vp:
             self._toggle_lock_viewport()
             event.accept()
-        # 空格键：绑定沉浸全屏 开/关！
         elif key == Qt.Key_Space:
             self._toggle_fullscreen()
             event.accept()
-        # R 键：专注眼部自适应特写 开/关！
-        elif key == k_eye:
-            self._toggle_eye_zoom()
-            event.accept()
-
-        # R 键：战术交接判定
         elif key == k_eye:
             if self.is_aiming:
                 self.is_aiming = False
+                self._is_warping = False
                 self.unsetCursor()
                 self._apply_eye_zoom()
             else:
                 self._toggle_eye_zoom()
             event.accept()
-
         elif key == k_af:
             self._toggle_af_points()
             event.accept()
@@ -4678,7 +4668,6 @@ class SinglePhotoViewer(QWidget):
             self.lbl_crop_live_ratio.setText(live_txt)
             self.lbl_crop_live_ratio.setVisible(True)
         else:
-            self.lbl_crop_live_ratio = QLabel("4:5", self)
             self.lbl_crop_live_ratio.setVisible(False)
 
     def _toggle_crop_active(self):

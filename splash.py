@@ -26,7 +26,7 @@ from PySide6.QtGui import QPainter, QColor, QFont, QKeyEvent, QMouseEvent
 try:
     from main import APP_VERSION
 except Exception:
-    APP_VERSION = "Beta 4.2.0"
+    APP_VERSION = "Beta 5.0.0"
 
 # ==================== 自检日志内容 ====================
 # (文本, 下一行出现的间隔秒数)
